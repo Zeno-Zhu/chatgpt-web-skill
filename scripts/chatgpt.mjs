@@ -779,6 +779,9 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   wait [--timeout 600]         等待回复完成
   read [--md] [--save]         读取最后一条回答（含图片/代码块）
   ask --text-file f [--file f] 一条龙：send → wait → read
+                               ⚠️ 接在**当前活跃会话**里。要开新会话先跑 new，
+                                  要指定上下文先跑 goto <url> 或 project <名字>；
+                                  否则问题会混进上一个话题（上线前务必确认）
                                注意：返回的 text 受 --max-chars（默认 4000）限制；
                                加 --md 会同时把**全文**落盘到 CHATGPT_OUT_DIR
   model [名称]                 查看或切换模型

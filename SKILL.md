@@ -140,6 +140,9 @@ node <skill>/scripts/chatgpt.mjs method --v 2 --e 0 --p 0 --a 0 --m 0 --f 0 --x 
 - prompt 里明确四件事：**角色/目标、判断标准、输出格式、不确定时怎么办**。
 - 一次只问一件事。需要多方比较时，分开提问而不是堆在一段里。
 
+⚠️ **`ask` / `send` 都接在"当前活跃会话"里。** 每次委托前先明确 Step 2 的上下文
+（`new` 开新会话 / `goto` 指定会话 / `project` 指定项目），否则问题会混进上一个话题。
+
 ### Step 4｜发送并等待
 ```bash
 # 长 prompt 用 --text-file，避免 shell 转义问题；附件可重复 --file
