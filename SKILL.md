@@ -58,6 +58,7 @@ description: 用确定性命令操控网页版 ChatGPT（复用已登录会话�
 
 **Invariants**
 - 不导出、不复制、不保存 cookie / token / localStorage / storage_state。
+  `/api/auth/session` 的 `accessToken` 只在内存里用于 `/backend-api/*`（生图取图），**不打印、不落盘、不进返回值**。
 - 不代替用户登录、过 MFA/CAPTCHA、点 OAuth 同意、绕过付费墙与限额。
 - 不静默降级模型：要 Pro 却拿不到，就如实报告可见选项，让用户决定。
 - 不往 ChatGPT 发送凭证类内容（cookie / API key / 私钥 / 身份证号），即使用户原始请求里带。
@@ -89,6 +90,8 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 | Wait | `wait [--timeout 秒]` | ✅ 只观察（会消费基线） |
 | Read | `read [--md] [--save]` | ✅ 只读；`--save` 会再落一份文件 |
 | Inspect | `tabs` / `model [名]` | ✅ 只读（`model` 带参会切换） |
+| Image | `image start` | ❌ **重跑 = 再开一个会话再生一张**（要防重就用 `--request-id` 之外的 jobId 记账；先 `image list` 看清在途） |
+| Image | `image list` / `wait` / `download` | ✅ 只读；`download` 会再落一份文件 |
 | Route | `route --impact N --uncertainty N --gap N` | ✅ 纯计算，决定该不该调用 |
 
 - `send` 只有在**明确确认上次未提交**（`submitted: false`）时才可安全重跑。
@@ -185,6 +188,38 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 - 长回答可能被 GPT 侧截断（出现"继续生成"）。此时**必须**标注"可能不完整"，并可 `send --text "继续"` 续写。
 - 深度研究报告正文在 iframe 内，`read` 取不到时如实说明，不要假装拿到了。
 
+### Step 5.5｜生图任务（一张图 = 一个 GPT 会话）
+
+```bash
+# 一个任务 = 一个新会话（"窗口"）：发完提示词、等 URL 定型就返回，**不等生成**
+node <skill>/scripts/chatgpt.mjs image start --text "画一张…" --json
+# → { jobId, conversationId, url, urlStable: true, inFlight, max }
+
+node <skill>/scripts/chatgpt.mjs image list --json          # 每个任务：ready / generating / text_only / failed
+node <skill>/scripts/chatgpt.mjs image wait --job <id>      # 等某张出图
+node <skill>/scripts/chatgpt.mjs image download --job <id> [--out <目录>]
+node <skill>/scripts/chatgpt.mjs image download --all       # 收所有已出图的
+node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：start → wait → download
+```
+
+规则（照此执行，不要自己发明流程）：
+
+- **可以连续开**：`start` 返回后立刻可以 `start` 下一个新会话，生成在服务端并行；
+  默认**同时在途上限 10**（`--max` / `CHATGPT_IMAGE_MAX` / config `imageMaxInFlight` 可调），
+  超了返回 `IMAGE_LIMIT_REACHED`。**"在途"= 还没被观测到完成的任务**：跑一次
+  `image list` / `wait` / `download` 观测到出图后名额**立即**释放（不必等下载完）——
+  所以只 start 不收图会把名额占满。
+- `urlStable: false`（极少数情况下 30s 内仍是临时 `WEB:` id）→ 如实转述，别把它当稳定入口。
+- 收图**不需要**点回那个会话：`image download` 按会话 id 读会话 JSON 并下载。
+  这是**故意**不用 DOM 的：实测会话被切走后页面里根本没有图片元素（只有空的
+  `image-gen-overlay-*` 壳），抓 DOM 会得到 0 张图。
+- 落盘：`<CHATGPT_OUT_DIR>/<jobId>/<序号>-<服务端文件名>.<ext>` + `images.json` 元数据
+  （fileId / 字节数 / 宽高 / 校验结果）。**一张图一个文件**，多张自动编号。
+- 状态语义：`ready`=有图可下；`generating`=还在生成；`text_only`=模型只回了文字（没出图，
+  把 `lastText` 原样给用户看）；`failed`=报错/会话不可访问。
+- 凭证：`/backend-api/*` 需要应用内 access token（`/api/auth/session`）。
+  **只在内存里用于本次请求，绝不打印、绝不落盘、绝不返回值里带上**——这是 Protected Rule。
+
 ### Step 6｜异常路由（只走已定义出口）
 
 `wait` 的 `status` 与出口一一对应：
@@ -192,6 +227,10 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 | status / 现象 | 出口 | 动作 |
 |---|---|---|
 | `success` | commit | 进入 Step 7 |
+| `IMAGE_LIMIT_REACHED` | wait | 在途已达上限 → 先 `image download` 收掉已出图的（空位自动释放），再 start |
+| `IMAGE_JOB_NOT_FOUND` | repair | `image list` 确认 jobId / conversationId |
+| 生图 `text_only` | report | 模型没出图只回了文字 → 原文给用户，别假装有图 |
+| `attachment-not-confirmed` | repair | 附件 chip 没确认渲染 → 本次未发送（**不要**当成功）；看 `probe`/`attachInput` |
 | `NO_CDP` | repair | 跑 `launch`，失败则报告 |
 | `CHROME_NOT_FOUND` | repair | 绑定的浏览器路径不存在或本机没有浏览器 → `init --browser <绝对路径>` |
 | `SPAWN_FAILED` / `CDP_TIMEOUT` | repair | 浏览器没起来 / 起来了但没开调试端口；先手工执行 hint 里的命令看报错 |

@@ -129,8 +129,10 @@ node scripts/chatgpt.mjs doctor
 chatgpt-web/
 ├── SKILL.md                  # 任务契约 / R1 运行时 / 原子命令 / Gate / 异常路由
 ├── scripts/
-│   ├── chatgpt.mjs           # CLI：核心原子动作 + 路由 Gate + 协议 + init/config
+│   ├── chatgpt.mjs           # CLI：核心原子动作 + 路由 Gate + 协议 + init/config + image
 │   ├── lib.mjs               # 跨平台浏览器解析 + 机器级绑定 + 实例隔离 + latch 完成判定
+│   ├── compose.mjs           # 页面交互层：选择器 / 注入 / 提交（普通对话与生图共用一份）
+│   ├── images.mjs            # 生图任务账本 + 会话 JSON 解析 + 图片下载（含凭证纪律）
 │   ├── config.mjs            # 机器级绑定：~/.chatgpt-web/config.json + profile 探测（只读、不解密）
 │   ├── procs.mjs             # 尽力读取浏览器进程启动参数（验证 profile / 发现占用）
 │   ├── e2e-smoke.mjs         # 端到端冒烟测试（断言每一步契约）
@@ -265,7 +267,6 @@ latch 之后四项同时成立才算完成，且**全部绑定目标 assistant �
 - 长回答被截断、Deep Research 正文在 iframe 内取不到时，**如实标注**，不假装拿到。
 
 ### 7｜机器级显式绑定：用哪个浏览器 + 哪个已登录 profile
-
 skill 不猜"这台机器的 GPT 登录在哪个 profile 里"——猜错的代价是**让用户重复登录（风控风险）**，
 或者**打开的不是用户指定的浏览器**。所以：
 
@@ -279,6 +280,53 @@ skill 不猜"这台机器的 GPT 登录在哪个 profile 里"——猜错的代�
   不匹配 → `PROFILE_MISMATCH`（拒止，不静默用别的 profile）；被别的实例占用 → 
   `PROFILE_IN_USE_NO_CDP` / `PROFILE_IN_USE_OTHER_PORT`（拒止，不杀用户浏览器、不换 profile）。
 - 拿不到进程信息（平台不支持 / 权限不足）时 `profileVerified: null`，doctor 明说"无法验证"。
+
+## 生图（一张图 = 一个 GPT 会话）
+
+```bash
+# 一个任务 = 一个**新会话**（不是新标签页）：发完提示词、等 URL 定型就返回，不等生成
+node scripts/chatgpt.mjs image start --text "画一只戴墨镜的柴犬" --json
+# → { jobId, conversationId, url, urlStable: true, inFlight: 1, max: 10 }
+
+# 立刻可以再开下一个会话继续生（服务端并行；默认同时在途上限 10）
+node scripts/chatgpt.mjs image start --text "再来一张同风格的猫" --json
+
+node scripts/chatgpt.mjs image list                      # ready / generating / text_only / failed
+node scripts/chatgpt.mjs image wait --job <id>           # 等某张出图
+node scripts/chatgpt.mjs image download --job <id>       # 按会话 id 收图到本地文件夹
+node scripts/chatgpt.mjs image download --all            # 收全部已出图的（空位随之释放）
+node scripts/chatgpt.mjs image run --text "画一张…"       # 单张一条龙
+```
+
+落盘结构（**一张图一个文件**，多图自动编号）：
+
+```text
+<CHATGPT_OUT_DIR>/<jobId>/
+├── 1-绿色圆盘中的数字9.png      # 文件名取自服务端 fn=（GPT 给图片起的名字）
+├── 2-….png
+└── images.json                  # fileId / 字节数 / 宽高 / 每个文件的校验结果
+```
+
+关键设计（都有实机取证，见 REVIEW.md 第六节）：
+
+| 决定 | 原因 |
+|---|---|
+| `start` 只记录会话、不等生成 | 生成在服务端并行；这样才可能"每个会话发完就开下一个"，上限 10 个在途 |
+| 收图走**会话 JSON**（`/backend-api/conversation/<id>`），不抓 DOM | 实测被切走的会话里 DOM **一张图都没有**（只有空的 `image-gen-overlay-*` 壳）；抓 DOM 会得 0 张 |
+| 下载链路 `/files/<id>/download` → `download_url` | 实测返回真 PNG（791638 B，PNG 魔数 + 1254×1254 像素采样核对） |
+| `accessToken` 只在内存用 | `/backend-api/*` 需要应用内 token；**不打印、不落盘、不进返回值**（Protected Rule） |
+| 字节/魔数/尺寸三重校验 | 防止把 JSON 错误页或 0 字节文件当图片落盘 |
+| 空位在"完成被观测到"时释放 | 在途 = 还没被观测到完成的任务；`image list/wait/download` 看到出图即释放名额（不必等下载完）。只 start 不收图会占满名额 |
+
+### 8｜生图：凭证与"不要抓 DOM"
+
+生图相关命令见上文。两条硬规则：
+
+- `/backend-api/*`（会话 JSON、图片下载）需要 `/api/auth/session` 里的 `accessToken`。
+  它**只在内存里用于本次请求**：不打印、不落盘、不作为返回值字段——与"不碰凭证"是同一条规则。
+- 图片**不从 DOM 取**。实测：生图完成后被切走的会话里，DOM 里没有 `<img>`/`<canvas>`/背景图，
+  只有空的 `image-gen-overlay-*` 壳节点；而会话 JSON 里图片带着 `size_bytes`/`width`/`height`，
+  是可直接校验的权威来源。抓 DOM 会"看起来成功但拿到 0 张图"。
 
 ## 验证
 

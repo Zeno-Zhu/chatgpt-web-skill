@@ -8,6 +8,9 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import { resolveBinding } from './config.mjs';
 import { scanBrowserProcesses, findCdpInstance, findProfileUser, samePath } from './procs.mjs';
+import { SELECTORS } from './compose.mjs';
+
+export { SELECTORS };
 
 // ---------- 环境解析（跨平台）----------
 // 实例作用域：不同 agent 想互不干扰时，各自设 CHATGPT_AGENT=trae 等，
@@ -31,8 +34,7 @@ const SCOPE = AGENT === 'default' ? '' : `-${AGENT}`;
 
 export const CDP_PORT = Number(BINDING.keys.cdpPort || (9444 + hashPort(SCOPE)));
 export const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
-export const PROFILE_DIRECTORY = BINDING.keys.profileDirectory || null;
-export const PROFILE = BINDING.keys.userDataDir
+export const PROFILE_DIRECTORY = BINDING.keys.profileDirectory || null;export const PROFILE = BINDING.keys.userDataDir
   || path.join(os.homedir(), '.chatgpt-web', `profile${SCOPE}`);
 export const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 export const TABS_FILE = path.join(STATE_DIR, `tabs${SCOPE}.json`);
@@ -215,7 +217,9 @@ export function writeTabs(obj) {
   fs.writeFileSync(TABS_FILE, JSON.stringify(obj, null, 2));
 }
 
-// 找到（或创建）ChatGPT 标签页
+// 找到（或创建）ChatGPT 标签页。生图任务与普通对话**共用**同一个标签页：
+// "一个窗口"指的是 GPT 里的一个新会话（新聊天），不是浏览器标签页；
+// 每个会话的 URL 会被记账，之后按会话 id 直接取图（见 scripts/images.mjs）。
 export async function getPage(browser, { create = true } = {}) {
   const ctx = browser.contexts()[0];
   const pages = ctx.pages().filter((p) => /chatgpt\.com/.test(p.url()));
@@ -226,19 +230,16 @@ export async function getPage(browser, { create = true } = {}) {
   return page;
 }
 
-export const SELECTORS = {
-  composer: '#prompt-textarea',
-  composerFallback: "textarea[name='prompt-textarea']",
-  send: "button[data-testid='send-button']",
-  stop: "button[data-testid='stop-button']",
-  voice: "button[aria-label='启动语音功能'], button[aria-label='Start voice mode']",
-  turn: "[data-testid^='conversation-turn-']",
-  user: "[data-message-author-role='user']",
-  assistant: "[data-message-author-role='assistant']",
-  copyBtn: "button[data-testid='copy-turn-action-button']",
-  login: "button[data-testid='login-button'], a[href*='auth/login']",
-  newChat: "a[data-testid='create-new-chat-button']",
-};
+// 在同一个标签页里开一个**新的 GPT 会话**（新聊天），并等 composer 真正可用。
+// 新标签页/新会话在 domcontentloaded 时 composer 还没渲染，此时判定登录态会误报 NOT_LOGGED_IN（实测）。
+export async function openNewChat(page) {
+  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  for (let i = 0; i < 40; i++) {
+    if (await page.locator(SELECTORS.composer).count().catch(() => 0)) break;
+    await sleep(500);
+  }
+  return page;
+}
 
 export async function isLoggedIn(page) {
   if (await page.locator(SELECTORS.composer).count()) return true;
@@ -319,9 +320,23 @@ export async function waitForCompletion(page, {
   let stopGoneSince = 0;
   let lastError = null;
   let drift = false;
+  let evalErrors = 0;
 
   while (Date.now() < deadline) {
-    const s = await page.evaluate(PROBE, base);
+    let s;
+    try {
+      s = await page.evaluate(PROBE, base);
+    } catch (e) {
+      // 生成中途页面会导航（生图会先说临时 URL、随后换成正式 UUID，甚至整页重载），
+      // 执行上下文被销毁会让 evaluate 抛错。这**不是**失败信号：继续等，别把整次 wait 判死。
+      // 2026-09-20 实测：修之前带生图的会话直接返回 "Execution context was destroyed"。
+      evalErrors++;
+      if (evalErrors > 120) {
+        return { done: false, status: 'ui_changed', text: lastText, elapsedMs: Date.now() - start, detail: e.message.slice(0, 160) };
+      }
+      await sleep(pollMs);
+      continue;
+    }
     lastError = s.errorText;
 
     // 会话漂移检测：绝不能把另一个会话的回答当成本次结果
@@ -355,9 +370,11 @@ export async function waitForCompletion(page, {
     const idle = !s.streaming && !s.working;
 
     if (textQuiet && stopQuiet && idle) {
-      // 双采样确认：间隔 500ms 两次内容一致才落地，避免瞬时静止误判
+      // 双采样确认：间隔 500ms 两次内容一致才落地，避免瞬时静止误判。
+      // 这里同样要容忍导航（生图/长回复都可能触发重载）。
       await sleep(500);
-      const s2 = await page.evaluate(PROBE, base);
+      let s2;
+      try { s2 = await page.evaluate(PROBE, base); } catch { await sleep(pollMs); continue; }
       if (s2.text === lastText && !s2.stop) {
         const status = classify(s2, { sawStop, sawTarget, text: lastText, errorText: lastError });
         if (status) return { done: false, status, text: lastText, elapsedMs: Date.now() - start, assistantCount: s2.assistantCount };

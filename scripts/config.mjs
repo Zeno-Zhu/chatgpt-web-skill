@@ -29,6 +29,7 @@ export const BINDING_ENV = {
   profileDirectory: 'CHATGPT_PROFILE_DIRECTORY',
   cdpPort: 'CHATGPT_CDP_PORT',
   agent: 'CHATGPT_AGENT',
+  imageMaxInFlight: 'CHATGPT_IMAGE_MAX',
 };
 
 export const BINDING_HINT = {
@@ -37,6 +38,7 @@ export const BINDING_HINT = {
   profileDirectory: 'user-data-dir 内的 Chrome profile 名（Default / Profile 1 …），不填就是 Default',
   cdpPort: '调试端口，默认 9444（多实例时按 agent 名偏移）',
   agent: '实例名：不同宿主用它隔离 profile 目录名/端口/锁文件',
+  imageMaxInFlight: '同时最多几张图在途（默认 10）；每张图占一个标签页，完成并下载后释放空位',
 };
 
 export function readConfig(file = CONFIG_FILE) {

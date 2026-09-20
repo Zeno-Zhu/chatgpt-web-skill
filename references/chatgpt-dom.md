@@ -16,6 +16,27 @@ ChatGPT 前端会漂移；选择器失效时只改本文件 + `scripts/chatgpt.m
 | 侧边栏开合 | `button[data-testid='close-sidebar-button']` | `aria-label="关闭边栏"/"打开边栏"` |
 | 文件上传 | `input[type='file']` | 隐藏 input，用 `setInputFiles` |
 
+### 1.1 文件输入框有 5 个，**只有一个是文档附件**
+
+2026-09-20 实测（同一页面 DOM 顺序）：
+
+| 顺序 | id | accept | 用途 | 会渲染文档 chip？ |
+|---|---|---|---|---|
+| 0 | `#upload-files` | 无 | **文档附件（唯一可用）** | ✅ |
+| 1 | `#upload-photos` | `image/*` | 图片上传（生图/看图 UI） | ❌ |
+| 2 | `#upload-media` | `image/*,video/*` | 媒体上传 | ❌ |
+| 3 | `#upload-camera` | `image/*` | 拍照 | ❌ |
+| 4 | `#upload-media-files` | `image/*,video/*` | 媒体（隐藏） | ❌ |
+
+> **坑**：用 `input[type='file']` 的 `.first()` 是**顺序依赖**的。页面进入生图相关状态时，
+> 媒体输入框可能排到前面 → 文件被"照片"通道吃掉，`input.files.length` 仍然是 1，
+> 但 **chip 不渲染**，最终表现为 `attachment-not-confirmed`（看起来像 UI 改版，其实是投错了框）。
+> 必须显式用 `#upload-files`（兜底 `input[type='file']:not([accept])`）。
+
+> **坑**：同一个文件重复上传时 ChatGPT 会**去重重命名**（`attach.md` → `attach(2).md`），
+> 而**草稿里的附件会跨"新聊天"导航保留**。用精确文件名匹配 chip 会得到 `inForm: 0` → 误报失败。
+> 匹配要容忍 `(n)` 后缀，并把"被重命名"当作"草稿里本来就有同名附件"的证据上报。
+
 ## 2. 消息与回复
 
 | 元素 | 选择器 |
@@ -143,6 +164,31 @@ el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true,
 - 图片出现在 assistant 消息内，是 `<img>`（`src` 指向 `https://chatgpt.com/backend-api/...` 或 blob）。
 - 抓取时过滤掉头像/图标类 URL（`avatar|profile|emoji|icon`）。
 - `read --save` 时用页面自带 `request` 上下文下载，避免额外鉴权。
+
+### ⚠️ 生图**不要**抓 DOM（2026-09-20 实测）
+
+生图进行中/完成后的会话里，DOM 里**可能一张图都没有**：
+
+- `conversation-turn-2`（assistant 轮）内只有"编辑"按钮 + 空的 `data-conversation-screenshot-content`；
+- 页面上只有 `image-gen-overlay-actions` / `image-gen-overlay-left-actions` /
+  `good-image-turn-action-button` 这类**空壳**节点，没有 `<img>`、没有 `<canvas>`、
+  没有背景图、没有 iframe、shadow root 也不是承载者；
+- 但会话 JSON 里图片**确实存在且已完成**（`status: finished_successfully`）。
+
+**权威来源是会话 JSON**：`GET /backend-api/conversation/<id>`（需要
+`Authorization: Bearer <accessToken>`，token 来自 `/api/auth/session`；只带 cookie 会 404
+`conversation_inaccessible`）。图片是消息里的 `image_asset_pointer`：
+
+```json
+{ "content_type": "image_asset_pointer",
+  "asset_pointer": "sediment://file_0000000070d081fd8cdf5a4e751234ff",
+  "mime_type": "image/png", "size_bytes": 791638, "width": 1254, "height": 1254 }
+```
+
+下载两步（实测 791638 B、PNG 魔数 `89504e470d0a1a0a`）：
+
+1. `GET /backend-api/files/<fileId>/download` → `{ "download_url": "…/estuary/content?id=…&fn=<文件名>&…" }`
+2. `GET <download_url>` → 图片字节（`fn=` 就是 GPT 给图片起的名字，可保留为本地文件名）
 
 ## 8. 深度研究 / Canvas 等特殊产物
 

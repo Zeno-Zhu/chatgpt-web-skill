@@ -178,7 +178,63 @@ Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`�
 （目录名自带 origin）+ `Local Storage\leveldb\*` 里的明文 origin。
 拿不到任何证据时如实返回 `null`（unknown），**不返回 false**。
 
-## 六、仍未解决 / 未验证（诚实清单）
+## 六、生图任务实机验证（2026-09-20，Windows）
+
+需求：**在聊天流程里让 GPT 生图，并把图片下载到本地文件夹**；
+语义是"**一张图 = 一个 GPT 会话（新聊天）**"——每个会话发完提示词、等 URL 定型即可开下一个，
+同时最多 N 张在途，收图时按会话回取。
+
+### 关键取证（决定了实现方式）
+
+| 现象 | 实测证据 |
+|---|---|
+| 生图**成功**了 | 会话 JSON 里 `image_asset_pointer: sediment://file_0000000070d081fd8cdf5a4e751234ff`，`image/png`，`size_bytes: 791638`，`1254x1254` |
+| 但 **DOM 里没有图** | `conversation-turn-2` 内只有"编辑" + 空的 `data-conversation-screenshot-content`；全页只有 `image-gen-overlay-*` 空壳节点，无 `<img>`/`<canvas>`/背景图/iframe |
+| 后端 API 需要应用内 token | 只带 cookie 请求 `/backend-api/conversation/<id>` → **404 `conversation_inaccessible`**；带 `Authorization: Bearer`（来自 `/api/auth/session`，plus 账号）→ 200 |
+| 下载链路可用 | `/backend-api/files/<id>/download` → JSON `download_url` → GET 得 791638 B，魔数 `89504e470d0a1a0a`（PNG） |
+| URL 确实稳定 | 临时 `/c/WEB:<uuid>` → 约 15s 后换成正式 UUID，之后不再变（文本对话通常 1s 内定型） |
+| **页面切走不影响生成** | 会话 B 刚定型就开 C（同一标签页导航走），B 仍在服务端生成完成并 `ready` |
+
+### 落地的命令与语义
+
+`image start`（开新会话 + 发提示词 + 等 URL 定型 + 记账，**不等生成**）、
+`image list` / `image wait` / `image download [--all]` / `image run`。
+同时在途上限默认 10（`--max` / `CHATGPT_IMAGE_MAX` / config `imageMaxInFlight`），
+**"在途"= 还没被观测到完成的任务**：`image list/wait/download` 观测到出图后名额立即释放
+（这正好对应用户说的"前面生成完后面又可以补充进去"）；落盘
+`<CHATGPT_OUT_DIR>/<jobId>/<序号>-<服务端文件名>.<ext>` + `images.json`。
+
+### 本轮实机发现并修掉的缺陷
+
+| # | 缺陷 | 根因（实测） | 修法 |
+|---|---|---|---|
+| 1 | `wait` 直接崩：`Execution context was destroyed` | 生成中途页面导航（临时 URL → 正式 UUID / 整页重载），`page.evaluate` 抛错被当成失败 | 采样与双采样都容忍导航（连续失败上限后才报 `ui_changed`） |
+| 2 | 生图任务误报 `NOT_LOGGED_IN` | 新标签页 `domcontentloaded` 时 composer 还没渲染，`isLoggedIn` 只看 `#prompt-textarea` | 开新会话/新标签页后**等 composer 出现**再判定 |
+| 3 | 附件 chip 检测失败（`inForm: 0`，`inputFiles: 1`） | 页面有 **5 个 file input**；`input[type=file]` 的 `.first()` 顺序依赖，文件被"照片"通道吃掉，chip 不渲染 | 显式投给 `#upload-files`（兜底 `input[type=file]:not([accept])`），并在返回值里带 `attachInput` |
+| 4 | 修 #3 后**仍然**检测失败 | 草稿里的同名附件跨"新聊天"保留 → ChatGPT 去重重命名为 `attach(2).md`，而匹配用的是**精确文件名** | 匹配容忍 `(n)` 后缀，并把 `attachmentsRenamed` 作为"草稿里本来就有同名附件"的证据上报 |
+| 5 | 生图收图拿到 0 张图 | 见上表"DOM 里没有图" | 改走会话 JSON + `/files/<id>/download`（并且**不解密、不导出凭证**） |
+
+### 验证结果（真实生成 + 落盘 + 像素核对）
+
+- 三个任务并行（A 绿圆 9 / B 橙三角 / C 紫五角星），`image wait --all` 全部 `ready`；
+  B 是在"页面已被 C 切走"的情况下照样生成完的。
+- `image download --all` 落盘 3 个 PNG，`verified: true`（下载字节 == 服务端 `size_bytes`），
+  `images.json` 记录 fileId/尺寸/校验。
+- 用浏览器把 PNG 解码后采样像素核对内容：绿圆 center `rgb(2,172,7)`、橙三角 center `rgb(254,129,6)`、
+  紫五角星 center `rgb(141,5,212)`，四角均为近白 —— 与提示词一致（不依赖任何图像库）。
+- 上限闸门：在途 1 时 `--max 1` → `IMAGE_LIMIT_REACHED`（不消耗生成）；下载后 in-flight 归 0，
+  再 `--max 1` 即可继续 start。
+- 重构 `send`/DOM 层（抽到 `compose.mjs`）后**回归复测**普通对话 + 附件：`attachmentReady: true`，
+  GPT 再次回读了附件里的 `ALPHA-7788`。
+
+### 工程教训（Windows 专属，踩了两次）
+
+- **不要用 PowerShell 的 `Get-Content -Raw` + `Set-Content` 改写源码**：Windows PowerShell 默认按
+  系统 ANSI（本机 CP936）读 UTF-8 文件 → 中文被转成 mojibake、不可逆处变成 `?`，写回时还带 BOM
+  破坏 shebang。本轮 `scripts/chatgpt.mjs` 就是这样被写坏（352 个 U+FFFD），只能 `git checkout` 后重做。
+  结论：**改文件用 UTF-8 安全的编辑器/工具；要校验就 `node --check` + 统计 U+FFFD**。
+
+## 七、仍未解决 / 未验证（诚实清单）
 
 - **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次（或绑定用户已有的登录 profile，
   见 `init`）。已用 `doctor` 把这一步显性化。
@@ -187,7 +243,9 @@ Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`�
 - **路由阈值未校准**：`route` 的 4/2 阈值、`method` 的 7 信号映射，均来自设计推理 + 三轮压测，
   **未用真实任务回放校准**（方法见 `THINKING.md` 第 9 节）。
 - **`cancel` / `read --after`**：已在协议里定义语义，尚未实现。
-- **项目身份校验**：未用真实项目做端到端验证（当前以 URL 的 `projectId` 为权威判据）。
-- **并发实例未压测**：实例隔离逻辑已实测端口/profile 分离，但**未做多 agent 真实并发压测**。
+- **图片生成落盘**：已实机验证（见第六节）。仍**未**验证多图（一次返回 2 张以上）与图生图
+  （用 `--file` 传参考图）、以及 `read --save` 这条旧的 DOM 抓图路径（生图已改走会话 JSON）。
+- **Deep Research**：正文在 iframe 内，`read` 取不到；未实机验证。
+- **`project` 项目上下文**：未在 Windows 实机验证（当前以 URL 的 `projectId` 为权威判据）。
 - **"开机即用"未落地**：目前靠用户/上层显式 `launch`。要让那个已登录 profile 在开机后自动带调试端口启动，
   需在 Windows 上做快捷方式/登录时计划任务（参数必须与 `config` 输出一致）；本仓库不代为创建系统级任务。
