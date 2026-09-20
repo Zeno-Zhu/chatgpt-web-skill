@@ -1,0 +1,40 @@
+{
+  "name": "chatgpt-web-skill",
+  "version": "1.0.0",
+  "description": "让 dsh / workbuddy / trae / codex 等 agent 用确定性命令操控网页版 ChatGPT：路由 Gate、幂等发送、多轮研讨协议",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "bin": { "chatgpt-web": "scripts/chatgpt.mjs" },
+  "files": [
+    "SKILL.md",
+    "COORDINATION.md",
+    "THINKING.md",
+    "README.md",
+    "references",
+    "scripts"
+  ],
+  "scripts": {
+    "doctor": "node scripts/chatgpt.mjs doctor",
+    "launch": "node scripts/chatgpt.mjs launch",
+    "status": "node scripts/chatgpt.mjs status",
+    "e2e": "node scripts/e2e-smoke.mjs",
+    "install-skills": "bash scripts/install.sh"
+  },
+  "dependencies": {
+    "playwright-core": "1.60.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "agent-skill",
+    "chatgpt",
+    "cdp",
+    "playwright",
+    "deterministic-workflow",
+    "dsh",
+    "codex",
+    "trae"
+  ]
+}

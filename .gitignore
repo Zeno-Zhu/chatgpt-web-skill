@@ -1,0 +1,8 @@
+node_modules/
+chatgpt-out/
+.browser/
+.env.agent
+*.log
+
+# 任务产物与运行数据不进仓库（Skill 只承载可复用能力）
+tasks/
