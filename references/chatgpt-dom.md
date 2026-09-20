@@ -165,19 +165,32 @@ el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true,
 - 抓取时过滤掉头像/图标类 URL（`avatar|profile|emoji|icon`）。
 - `read --save` 时用页面自带 `request` 上下文下载，避免额外鉴权。
 
-### ⚠️ 生图**不要**抓 DOM（2026-09-20 实测）
+### ⚠️ 生图的图**只有前台标签页**才在 DOM 里；取图优先走会话 JSON
 
-生图进行中/完成后的会话里，DOM 里**可能一张图都没有**：
+2026-09-20 实测（同一会话、同一时刻，只改前台/后台）：
 
-- `conversation-turn-2`（assistant 轮）内只有"编辑"按钮 + 空的 `data-conversation-screenshot-content`；
-- 页面上只有 `image-gen-overlay-actions` / `image-gen-overlay-left-actions` /
-  `good-image-turn-action-button` 这类**空壳**节点，没有 `<img>`、没有 `<canvas>`、
-  没有背景图、没有 iframe、shadow root 也不是承载者；
-- 但会话 JSON 里图片**确实存在且已完成**（`status: finished_successfully`）。
+| 标签页状态 | DOM 里有图吗 | 说明 |
+|---|---|---|
+| **前台**（`page.bringToFront()`） | ✅ 有 | 每个生成图是 `<img src="https://chatgpt.com/backend-api/estuary/content?id=file_…&ts=…&p=fs&cid=1&sig=…" >`，`naturalSize 1254x1254`；**冷加载最长要轮询 ~25s 才出现**（实测第 24s 才等到） |
+| 后台 | ❌ 没有 | 只有空的 `image-gen-overlay-actions` / `-left-actions` / `-right-actions` 壳节点；全页无 `<img>`/`<canvas>`/背景图/iframe |
 
-**权威来源是会话 JSON**：`GET /backend-api/conversation/<id>`（需要
-`Authorization: Bearer <accessToken>`，token 来自 `/api/auth/session`；只带 cookie 会 404
-`conversation_inaccessible`）。图片是消息里的 `image_asset_pointer`：
+所以：
+- **无人值守取图走会话 JSON**（`/backend-api/conversation/<id>` 的 `image_asset_pointer`
+  → `/backend-api/files/<fileId>/download` → `download_url`），不依赖前台/渲染；
+- 需要"模拟浏览器本身"时可用 DOM 路径：前台渲染出的 estuary URL **只用 cookie** 就能取到字节
+  （实测与带 Bearer、与 `/files/<id>/download` 三条路**字节与 SHA-256 完全相同**）。
+
+### 当前 UI **没有**"图片下载"按钮（2026-09-20 实测）
+
+- 图片 overlay：`编辑图片`、`分享此图片`（`image-gen-overlay-left-actions` / `-right-actions`）；
+- 会话"更多操作"菜单：`查看聊天中的文件` / `分享` / `置顶聊天` / `归档` / `删除` / `移至项目`；
+- 页面上唯一含"下载"的是无关的 **`下载应用`**（Download app）。
+  用宽松的 `[aria-label*='下载']` 会命中它 → 点了没反应、等 download 事件超时，
+  错报成 `DOWNLOAD_EVENT_TIMEOUT`（实测踩到过）。native 模式必须排除它，
+  并在没有真下载按钮时如实返回 `NATIVE_ACTION_UNAVAILABLE`。
+
+> 会话 JSON 里的图片是**权威且可校验**的：带 `mime_type` / `size_bytes` / `width` / `height`，
+> 下载后应逐项核对（字节数相等 + 魔数正确），这是"防假装成功"的判据。
 
 ```json
 { "content_type": "image_asset_pointer",
@@ -189,6 +202,11 @@ el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true,
 
 1. `GET /backend-api/files/<fileId>/download` → `{ "download_url": "…/estuary/content?id=…&fn=<文件名>&…" }`
 2. `GET <download_url>` → 图片字节（`fn=` 就是 GPT 给图片起的名字，可保留为本地文件名）
+
+> `/backend-api/*` 需要 `Authorization: Bearer <accessToken>`（来自 `/api/auth/session`）：
+> 只带 cookie 请求会话 JSON 会 404 `conversation_inaccessible`。
+> 但**图片本身的 estuary URL 不需要 token**（浏览器渲染图片用的就是 cookie）。
+> token 只允许在内存里用于本次请求，**不打印、不落盘**。
 
 ## 8. 深度研究 / Canvas 等特殊产物
 

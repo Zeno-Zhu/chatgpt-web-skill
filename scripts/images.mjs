@@ -15,6 +15,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { SELECTORS } from './compose.mjs';
 
 export const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 export const JOB_FILE = path.join(STATE_DIR, 'image-jobs.json');
@@ -156,6 +158,26 @@ export function sniffImage(buf) {
   return null;
 }
 
+export function sha256(buf) {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+// 一张图 → 一个文件（含字节数/魔数/SHA-256 记录，便于跨路径对比与复现）
+function writeImageFile(jobDir, index, buf, meta = {}) {
+  const sniffed = sniffImage(buf);
+  if (!sniffed) return { error: 'not-an-image', bytes: buf.length };
+  const base = safeName(meta.servedName ? path.basename(meta.servedName, path.extname(meta.servedName)) : '') || `${meta.fallbackName || 'image'}-${index + 1}`;
+  const file = path.join(jobDir, `${index + 1}-${base}.${sniffed}`);
+  fs.writeFileSync(file, buf);
+  return {
+    file, fileId: meta.fileId || null, bytes: buf.length, format: sniffed,
+    sha256: sha256(buf), mode: meta.mode || null,
+    mimeType: meta.mimeType || null, width: meta.width ?? null, height: meta.height ?? null,
+    servedName: meta.servedName || null,
+    verified: meta.sizeBytes ? buf.length === meta.sizeBytes : null,
+  };
+}
+
 // 一张图 → 一个文件（同一任务的多张图按 1/2/3 编号，各自独立落盘）
 export async function downloadAssets(page, job, assets, outDir) {
   const token = await accessToken(page);
@@ -169,33 +191,121 @@ export async function downloadAssets(page, job, assets, outDir) {
         `https://chatgpt.com/backend-api/files/${a.fileId}/download`,
         { headers: { Authorization: `Bearer ${token}` } },
       );
-      if (!dl.ok()) { errors.push({ fileId: a.fileId, error: `files-download-${dl.status()}` }); continue; }
+      if (!dl.ok()) { errors.push({ fileId: a.fileId, error: `files-download-${dl.status()}`, mode: 'api' }); continue; }
       const meta = await dl.json();
-      if (!meta.download_url) { errors.push({ fileId: a.fileId, error: 'no-download-url' }); continue; }
+      if (!meta.download_url) { errors.push({ fileId: a.fileId, error: 'DOWNLOAD_URL_FAILED', mode: 'api' }); continue; }
       const bin = await page.request.get(meta.download_url, { headers: { Authorization: `Bearer ${token}` } });
-      if (!bin.ok()) { errors.push({ fileId: a.fileId, error: `content-${bin.status()}` }); continue; }
-      const buf = await bin.body();
-      const sniffed = sniffImage(buf);
-      if (!sniffed) { errors.push({ fileId: a.fileId, error: 'not-an-image', bytes: buf.length }); continue; }
+      if (!bin.ok()) { errors.push({ fileId: a.fileId, error: `content-${bin.status()}`, mode: 'api' }); continue; }
       // 服务端 fn= 参数就是 GPT 给的图片名字（实测是中文描述），保留它更可读
       let served = '';
       try { served = decodeURIComponent(new URL(meta.download_url).searchParams.get('fn') || ''); } catch { /* ignore */ }
-      const base = safeName(path.basename(served, path.extname(served))) || `${job.conversationId}-${i + 1}`;
-      const file = path.join(jobDir, `${i + 1}-${base}.${sniffed}`);
-      fs.writeFileSync(file, buf);
-      saved.push({
-        file, fileId: a.fileId, bytes: buf.length, format: sniffed,
-        mimeType: a.mimeType, width: a.width, height: a.height,
-        servedName: served || null,
-        verified: a.sizeBytes ? buf.length === a.sizeBytes : null,
+      const rec = writeImageFile(jobDir, i, await bin.body(), {
+        fileId: a.fileId, mimeType: a.mimeType, width: a.width, height: a.height,
+        sizeBytes: a.sizeBytes, servedName: served, mode: 'api', fallbackName: job.conversationId,
       });
+      if (rec.error) { errors.push({ fileId: a.fileId, error: rec.error, bytes: rec.bytes, mode: 'api' }); continue; }
+      saved.push(rec);
     } catch (e) {
-      errors.push({ fileId: a.fileId, error: e.message.slice(0, 160) });
+      errors.push({ fileId: a.fileId, error: e.message.slice(0, 160), mode: 'api' });
     }
   }
   const meta = {
-    jobId: job.jobId, conversationId: job.conversationId, url: job.url,
+    jobId: job.jobId, conversationId: job.conversationId, url: job.url, mode: 'api',
     promptChars: job.promptChars ?? null, promptFile: job.promptFile ?? null,
+    downloadedAt: new Date().toISOString(), count: saved.length, files: saved, errors,
+  };
+  fs.writeFileSync(path.join(jobDir, 'images.json'), `${JSON.stringify(meta, null, 2)}\n`);
+  return { jobDir, saved, errors, manifest: path.join(jobDir, 'images.json') };
+}
+
+// ---------- 兜底路径 1：DOM（前台渲染出的 estuary URL + 浏览器自己的 cookie）----------
+// 实测（2026-09-20）：同一个 estuary URL 用 cookie 取、用 Bearer 取、走 /files/<id>/download 取，
+// 三条路字节与 SHA-256 **完全相同**。代价：必须前台渲染，且冷加载要轮询最多 ~25s 才出现 <img>。
+export async function downloadAssetsViaDom(page, job, assets, outDir, { timeoutMs = 60000 } = {}) {
+  const jobDir = path.join(outDir, job.jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const saved = [];
+  const errors = [];
+  await page.bringToFront();
+  await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  for (const [i, a] of assets.entries()) {
+    let src = null;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline && !src) {
+      src = await page.evaluate((fid) => {
+        const n = [...document.querySelectorAll('img')]
+          .find((x) => (x.currentSrc || x.src || '').includes(fid));
+        return n ? (n.currentSrc || n.src) : null;
+      }, a.fileId).catch(() => null);
+      if (!src) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!src) { errors.push({ fileId: a.fileId, error: 'IMAGE_ASSET_NOT_FOUND', mode: 'dom' }); continue; }
+    try {
+      const res = await page.request.get(src);            // 浏览器自己就是这么加载的 → 不带 token
+      if (!res.ok()) { errors.push({ fileId: a.fileId, error: `content-${res.status()}`, mode: 'dom' }); continue; }
+      let served = '';
+      try { served = decodeURIComponent(new URL(src).searchParams.get('fn') || ''); } catch { /* ignore */ }
+      const rec = writeImageFile(jobDir, i, await res.body(), {
+        fileId: a.fileId, mimeType: a.mimeType, width: a.width, height: a.height,
+        sizeBytes: a.sizeBytes, servedName: served, mode: 'dom', fallbackName: job.conversationId,
+      });
+      if (rec.error) { errors.push({ fileId: a.fileId, error: rec.error, bytes: rec.bytes, mode: 'dom' }); continue; }
+      saved.push(rec);
+    } catch (e) {
+      errors.push({ fileId: a.fileId, error: e.message.slice(0, 160), mode: 'dom' });
+    }
+  }
+  const meta = {
+    jobId: job.jobId, conversationId: job.conversationId, url: job.url, mode: 'dom',
+    downloadedAt: new Date().toISOString(), count: saved.length, files: saved, errors,
+  };
+  fs.writeFileSync(path.join(jobDir, 'images.json'), `${JSON.stringify(meta, null, 2)}\n`);
+  return { jobDir, saved, errors, manifest: path.join(jobDir, 'images.json') };
+}
+
+// ---------- 兜底路径 2：原生点击下载按钮 ----------
+// 必须先监听 download 事件再点击（Playwright 官方推荐模式），并要求前台 + 独占浏览器。
+// 当前 UI 没有图片下载按钮 → 如实返回 NATIVE_ACTION_UNAVAILABLE（不是 bug，是 UI 现状）。
+export async function downloadAssetsViaNative(page, job, assets, outDir, { timeoutMs = 20000 } = {}) {
+  const jobDir = path.join(outDir, job.jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const saved = [];
+  const errors = [];
+  await page.bringToFront();
+  await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const btn = page.locator(SELECTORS.imageDownloadButton).first();
+  if (!(await btn.count())) {
+    for (const a of assets) {
+      errors.push({
+        fileId: a.fileId, error: 'NATIVE_ACTION_UNAVAILABLE', mode: 'native',
+        hint: '当前网页版 UI 没有"图片下载"按钮（overlay 只有 编辑图片 / 分享此图片）。用 --mode api 或 --mode dom。',
+      });
+    }
+    return { jobDir, saved, errors, manifest: null };
+  }
+  for (const [i, a] of assets.entries()) {
+    try {
+      const [dl] = await Promise.all([
+        page.waitForEvent('download', { timeout: timeoutMs }),
+        btn.click({ force: true }),
+      ]);
+      const target = path.join(jobDir, `${i + 1}-${safeName(dl.suggestedFilename()) || `${job.conversationId}-${i + 1}`}`);
+      await dl.saveAs(target);
+      const buf = fs.readFileSync(target);
+      const rec = {
+        file: target, fileId: a.fileId, bytes: buf.length, format: sniffImage(buf),
+        sha256: sha256(buf), mode: 'native', servedName: dl.suggestedFilename(),
+        mimeType: a.mimeType, width: a.width, height: a.height,
+        verified: a.sizeBytes ? buf.length === a.sizeBytes : null,
+      };
+      if (!rec.format) { errors.push({ fileId: a.fileId, error: 'not-an-image', mode: 'native' }); continue; }
+      saved.push(rec);
+    } catch (e) {
+      errors.push({ fileId: a.fileId, error: /Timeout/.test(e.message) ? 'DOWNLOAD_EVENT_TIMEOUT' : e.message.slice(0, 160), mode: 'native' });
+    }
+  }
+  const meta = {
+    jobId: job.jobId, conversationId: job.conversationId, url: job.url, mode: 'native',
     downloadedAt: new Date().toISOString(), count: saved.length, files: saved, errors,
   };
   fs.writeFileSync(path.join(jobDir, 'images.json'), `${JSON.stringify(meta, null, 2)}\n`);

@@ -20,7 +20,7 @@ import {
 } from './compose.mjs';
 import {
   loadJobs, saveJobs, findJob, inFlight, newJobId, jobStatus, downloadAssets,
-  DEFAULT_MAX_IN_FLIGHT,
+  downloadAssetsViaDom, downloadAssetsViaNative, DEFAULT_MAX_IN_FLIGHT,
 } from './images.mjs';
 
 const OUT_DIR = process.env.CHATGPT_OUT_DIR || path.join(process.cwd(), 'chatgpt-out');
@@ -70,6 +70,7 @@ const STATES = {
   PROFILE_MISMATCH: 'FAILED', PROFILE_IN_USE_NO_CDP: 'FAILED', PROFILE_IN_USE_OTHER_PORT: 'FAILED',
   CONFIG_ERROR: 'FAILED',
   IMAGE_LIMIT_REACHED: 'FAILED', IMAGE_JOB_NOT_FOUND: 'FAILED',
+  FOREGROUND_REQUIRED: 'FAILED', NATIVE_ACTION_UNAVAILABLE: 'FAILED', IMAGE_ASSET_NOT_FOUND: 'FAILED',
 };
 
 function envelope(obj) {
@@ -978,7 +979,17 @@ async function cmdImage(args) {
       };
     }
     const browser = await connect();
+    let lockHeld = false;
     try {
+      const l = acquireLock(`image-start`);
+      if (!l.ok) {
+        return {
+          ok: false, status: 'busy',
+          error: `另一个任务正占用浏览器：${l.holder.job} (pid ${l.holder.pid})`,
+          hint: '生图 send 需要独占标签页，串行等待即可（生成在服务端并行，不耽误在途任务）',
+        };
+      }
+      lockHeld = true;
       const page = await getPage(browser);
       await openNewChat(page);                        // 新会话（不是新标签页）
       if (!(await isLoggedIn(page))) return { ok: false, error: 'NOT_LOGGED_IN', url: page.url() };
@@ -1009,6 +1020,7 @@ async function cmdImage(args) {
         nextAction: '可以立刻 image start 开下一个新会话生下一张；之后用 image list / image download --job <id> 收图',
       };
     } finally {
+      if (lockHeld) releaseLock();
       await browser.close().catch(() => {});
     }
   }
@@ -1053,14 +1065,38 @@ async function cmdImage(args) {
 
   if (sub === 'download') {
     const jobIds = args.job ? [args.job] : (args.all ? store.jobs.map((j) => j.jobId) : []);
-    if (!jobIds.length) return { ok: false, error: 'usage: image download --job <id> | --all [--out <目录>]' };
+    if (!jobIds.length) return { ok: false, error: 'usage: image download --job <id> | --all [--out <目录>] [--mode api|dom|native|auto]' };
+    const mode = String(args.mode || 'api').toLowerCase();
+    if (!['api', 'dom', 'native', 'auto'].includes(mode)) {
+      return { ok: false, error: 'CONFIG_ERROR', hint: '--mode 只支持 api | dom | native | auto（默认 api）', mode };
+    }
+    const allowUi = args['allow-ui'] === true;
+    const needsUi = mode === 'dom' || mode === 'native';
+    if (needsUi && !allowUi) {
+      return {
+        ok: false, error: 'FOREGROUND_REQUIRED', mode,
+        hint: `${mode} 模式需要把标签页切到前台（会抢用户焦点/滚动；后台标签页里图片根本不渲染），`
+          + '必须显式加 --allow-ui。无人值守请用默认 --mode api。',
+      };
+    }
     const browser = await connect();
+    let lockHeld = false;
     try {
+      if (needsUi) {
+        const l = acquireLock(`image-download-${mode}`);
+        if (!l.ok) {
+          return {
+            ok: false, status: 'busy', error: `另一个任务正占用浏览器：${l.holder.job} (pid ${l.holder.pid})`,
+            hint: 'UI 路径要独占窗口，串行等待',
+          };
+        }
+        lockHeld = true;
+      }
       const page = await getPage(browser, { create: false });
       const results = [];
       for (const id of jobIds) {
         const job = findJob(store, id);
-        if (!job) { results.push({ jobId: id, ok: false, error: 'job-not-found' }); continue; }
+        if (!job) { results.push({ jobId: id, ok: false, error: 'IMAGE_JOB_NOT_FOUND' }); continue; }
         let st = await jobStatus(page, job);
         if (st.state === 'generating' && args['no-wait'] !== true) {
           const deadline = Date.now() + Number(args.timeout || 600) * 1000;
@@ -1068,32 +1104,45 @@ async function cmdImage(args) {
         }
         if (st.state !== 'ready') {
           results.push({
-            jobId: job.jobId, conversationId: job.conversationId, ok: false,
-            state: st.state, error: st.error || null, lastText: st.lastText || null,
+            jobId: job.jobId, conversationId: job.conversationId, ok: false, mode,
+            state: st.state, error: st.error || (st.state === 'generating' ? 'IMAGE_ASSET_NOT_FOUND' : null),
+            lastText: st.lastText || null,
           });
           if (st.state === 'failed' || st.state === 'text_only') job.state = st.state;
           continue;
         }
-        const dl = await downloadAssets(page, job, st.assets, outDir);
-        job.state = 'downloaded';
-        job.downloadedAt = new Date().toISOString();
-        job.files = dl.saved.map((s) => s.file);
-        job.dir = dl.jobDir;
+        let usedMode = mode === 'auto' ? 'api' : mode;
+        let dl = usedMode === 'dom' ? await downloadAssetsViaDom(page, job, st.assets, outDir)
+          : usedMode === 'native' ? await downloadAssetsViaNative(page, job, st.assets, outDir)
+            : await downloadAssets(page, job, st.assets, outDir);
+        // auto：API 一张都没拿到、且用户显式允许抢前台 → 退到 DOM 路径（不会静默走 native 点击）
+        if (mode === 'auto' && dl.saved.length === 0 && allowUi) {
+          usedMode = 'dom';
+          dl = await downloadAssetsViaDom(page, job, st.assets, outDir);
+        }
+        if (dl.saved.length) {
+          job.state = 'downloaded';
+          job.downloadedAt = new Date().toISOString();
+          job.files = dl.saved.map((s) => s.file);
+          job.dir = dl.jobDir;
+        }
         results.push({
           jobId: job.jobId, conversationId: job.conversationId, url: job.url,
-          ok: dl.saved.length > 0, images: dl.saved.length, dir: dl.jobDir,
-          files: dl.saved, errors: dl.errors, manifest: dl.manifest,
+          mode: usedMode, ok: dl.saved.length > 0,
+          images: dl.saved.length, dir: dl.jobDir, files: dl.saved,
+          errors: dl.errors, manifest: dl.manifest,
         });
       }
       saveJobs(store);
       return {
-        ok: results.every((r) => r.ok), outDir, jobs: results,
+        ok: results.every((r) => r.ok), outDir, mode, jobs: results,
         inFlight: inFlight(store).length,
         hint: results.some((r) => !r.ok)
-          ? '未下载成功的任务看各自 state/error；text_only 表示模型只回了文字没出图'
+          ? '未下载成功的任务看各自 state/error；NATIVE_ACTION_UNAVAILABLE 表示当前 UI 没有图片下载按钮（用 api/dom）'
           : null,
       };
     } finally {
+      if (lockHeld) releaseLock();
       await browser.close().catch(() => {});
     }
   }
@@ -1139,8 +1188,9 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
                                （不等生成），可立刻开下一个新会话；同时最多 10 张在途（下载后空位释放）
   image list                   列出所有生图任务与状态（ready / generating / text_only / failed）
   image wait --job <id>        等某个任务出图
-  image download --job <id> [--out <目录>]
-                               按会话 id 把图下载到本地文件夹（一张图一个文件 + images.json 元数据）
+  image download --job <id> [--out <目录>] [--mode api|dom|native|auto] [--allow-ui]
+                               按会话 id 把图下载到本地文件夹（一张图一个文件 + images.json）
+                               默认 --mode api（不碰页面）；dom/native 要抢前台，必须加 --allow-ui
   image download --all         下载全部已出图的任务
   image run --text "..."       单张图一条龙：start → wait → download
   launch                       启动/复用那个绑定的浏览器（CDP ${CDP_URL}）

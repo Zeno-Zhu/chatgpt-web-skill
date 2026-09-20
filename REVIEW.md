@@ -234,7 +234,45 @@ Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`�
   破坏 shebang。本轮 `scripts/chatgpt.mjs` 就是这样被写坏（352 个 U+FFFD），只能 `git checkout` 后重做。
   结论：**改文件用 UTF-8 安全的编辑器/工具；要校验就 `node --check` + 统计 U+FFFD**。
 
-## 七、仍未解决 / 未验证（诚实清单）
+## 七、生图取图：三条路的实测对比（2026-09-20，第二轮）
+
+起因是有人问："为什么不模拟点击图片 → 点图片的下载？" 我们按"先取证再设计"重做了一轮：
+
+| 问题 | 实测答案 |
+|---|---|
+| 后台标签页里图片在 DOM 吗？ | **不在**。只有空的 `image-gen-overlay-*` 壳节点，全页无 `<img>`/`<canvas>`/背景图/iframe |
+| 前台呢？ | **在**：`page.bringToFront()` 后同一会话出现 3 个 `<img src="…/backend-api/estuary/content?id=file_…">`，`naturalSize 1254x1254`；但**冷加载要轮询 ~24s** 才出现 |
+| 有"图片下载"按钮吗？ | **没有**。图片 overlay 只有 `编辑图片` / `分享此图片`；会话"更多操作"只有 `查看聊天中的文件/分享/置顶聊天/归档/删除/移至项目`；唯一含"下载"的是无关的 `下载应用` |
+| 点图片会开灯箱吗？ | 不会（无 `role=dialog` / lightbox 出现） |
+| estuary URL 需要 token 吗？ | **不需要**（浏览器渲染图片用的就是 cookie）。但**会话 JSON** 需要 `Bearer accessToken`，只带 cookie 会 404 `conversation_inaccessible` |
+| 三条路字节一致吗？ | **完全一致**：cookie-only == with-token == `/files/<id>/download`，`bytes=723875`、`sha256=26d831a6638d3f9f…` |
+| 耗时对比 | api ≈ 2s（不碰页面）；dom ≈ **50.4s** 且要抢前台；native = 按钮不存在 |
+
+据此落地 `image download --mode api|dom|native|auto`：
+- 默认 **api**（主线、无人值守）；`dom`/`native` 必须显式 `--allow-ui`，否则 `FOREGROUND_REQUIRED`；
+- UI 路径独占浏览器（抢全局锁，占用时 `status: busy`）；
+- `auto` = api → （仅在 `--allow-ui` 时）dom；**绝不静默走 native 点击**；
+- 返回值带 `mode` / `fileId` / `bytes` / `sha256`，便于跨路径对比复现。
+
+### 本轮修掉的缺陷
+
+| # | 缺陷 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 之前文档断言"生图不要抓 DOM，DOM 里没有图"**不准确** | 当时标签页一直在后台；前台是会渲染的 | 改为"后台不渲染、前台渲染但要等 ~25s"，并保留 api 为默认（后台/无人值守仍不该抓 DOM） |
+| 2 | `native` 模式错报 `DOWNLOAD_EVENT_TIMEOUT` | 宽松选择器 `[aria-label*='下载']` 命中了无关的 **`下载应用`**（Download app），点了它自然等不到 download 事件 | 选择器收窄为 data-testid / 精确 label / overlay 范围，排除"下载应用"；没有真按钮时如实返回 `NATIVE_ACTION_UNAVAILABLE` |
+| 3 | UI 路径可能偷偷抢用户前台 | 最初实现无门禁 | 加 `--allow-ui` 硬门禁 + 全局锁 + `FOREGROUND_REQUIRED` |
+
+### 与 GPT 的协作结论（其中一次调用就是本 skill 自己发起的）
+
+GPT 的判断与实测一致：**API 做主链路，原生点击只做诊断/兜底**（UI 依赖前台渲染、按钮存在性、
+hover、文案漂移，还会抢用户焦点；`connectOverCDP` 官方也属较低 fidelity）。
+它同时给了可用建议并被采纳：`--mode api|native` 显式化、`--allow-ui` 门禁、
+先监听 `download` 事件再点击、返回 `mode/fileId/path/bytes/sha256`、
+以及**分层测试判据**（①事件/HTTP 成功 ②魔数+尺寸+字节数 ③重复下载 SHA 稳定
+④跨路径 SHA 相同作为强证据但不硬性要求字节一致）。
+风控上它指出：没有证据表明"模拟点击更安全"，真正该控的是频率/并发/会话 churn。
+
+## 八、仍未解决 / 未验证（诚实清单）
 
 - **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次（或绑定用户已有的登录 profile，
   见 `init`）。已用 `doctor` 把这一步显性化。
@@ -243,8 +281,10 @@ Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`�
 - **路由阈值未校准**：`route` 的 4/2 阈值、`method` 的 7 信号映射，均来自设计推理 + 三轮压测，
   **未用真实任务回放校准**（方法见 `THINKING.md` 第 9 节）。
 - **`cancel` / `read --after`**：已在协议里定义语义，尚未实现。
-- **图片生成落盘**：已实机验证（见第六节）。仍**未**验证多图（一次返回 2 张以上）与图生图
-  （用 `--file` 传参考图）、以及 `read --save` 这条旧的 DOM 抓图路径（生图已改走会话 JSON）。
+- **图片生成落盘**：已实机验证（第六、七节）。仍**未**验证：一次返回 2 张以上的多图会话、
+  图生图（`--file` 传参考图）、以及 `read --save` 这条旧的 DOM 抓图路径。
+- **`native` 模式**：当前 UI 无下载按钮，只验证到"如实报 `NATIVE_ACTION_UNAVAILABLE`"；
+  一旦 UI 加上按钮，`download` 事件路径需要重新实机验证。
 - **Deep Research**：正文在 iframe 内，`read` 取不到；未实机验证。
 - **`project` 项目上下文**：未在 Windows 实机验证（当前以 URL 的 `projectId` 为权威判据）。
 - **"开机即用"未落地**：目前靠用户/上层显式 `launch`。要让那个已登录 profile 在开机后自动带调试端口启动，

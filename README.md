@@ -293,9 +293,36 @@ node scripts/chatgpt.mjs image start --text "再来一张同风格的猫" --json
 
 node scripts/chatgpt.mjs image list                      # ready / generating / text_only / failed
 node scripts/chatgpt.mjs image wait --job <id>           # 等某张出图
-node scripts/chatgpt.mjs image download --job <id>       # 按会话 id 收图到本地文件夹
-node scripts/chatgpt.mjs image download --all            # 收全部已出图的（空位随之释放）
+node scripts/chatgpt.mjs image download --job <id>       # 按会话 id 收图到本地文件夹（默认 --mode api）
+node scripts/chatgpt.mjs image download --all            # 收全部已出图的
+node scripts/chatgpt.mjs image download --all --mode dom --allow-ui   # 兜底：走前台 DOM（会抢焦点）
 node scripts/chatgpt.mjs image run --text "画一张…"       # 单张一条龙
+```
+
+### 取图的三条路（实测对比）
+
+| mode | 机制 | 实测 | 该不该做主线 |
+|---|---|---|---|
+| `api`（默认） | `/backend-api/conversation/<id>` → `image_asset_pointer` → `/files/<id>/download` → `download_url` | 723875 B，~2s，不碰页面 | ✅ 主线（无人值守） |
+| `dom` | 前台渲染出的 `<img src=…estuary/content?id=file_…>` → 只用 cookie 取字节 | 723875 B，**50.4s**（等渲染 ~24s 起），**要前台** | ⛔ 兜底/对照 |
+| `native` | 点原生"下载"按钮 + 接 `download` 事件 | 当前 UI **没有**该按钮 → `NATIVE_ACTION_UNAVAILABLE` | ⛔ 仅当 UI 加了按钮 |
+
+三条路拿到的字节 **SHA-256 完全相同**（`26d831a6638d3f9f…`），所以 dom 是可信的对照路径；
+但它会抢用户焦点/滚动/切会话，必须显式 `--allow-ui`，且会占用全局锁。
+
+> 为什么不做成"点图片 → 点下载"？因为**实测当前网页版 UI 里根本没有图片下载按钮**：
+> 图片 overlay 只有 `编辑图片` / `分享此图片`，会话"更多操作"里只有
+> `查看聊天中的文件 / 分享 / 置顶聊天 / 归档 / 删除 / 移至项目`。
+> 唯一含"下载"的是无关的 `下载应用`——宽匹配会命中它并错报超时（已修）。
+> 结论与 GPT 给的建议一致：**API 做主链路，UI 路径只做诊断/兜底**。
+
+### 测试策略（复用已生成会话，不烧额度）
+
+```bash
+# 同一 conversation + fileId 反复下载，判据分层：①HTTP/事件成功 ②魔数+尺寸+字节数
+# ③api 重复下载 SHA 稳定 ④api vs dom 的 SHA 相同（强证据，但不硬性要求字节一致）
+node scripts/chatgpt.mjs image download --job <id> --json                      # 记下 sha256
+node scripts/chatgpt.mjs image download --job <id> --mode dom --allow-ui --json  # 比对 sha256
 ```
 
 落盘结构（**一张图一个文件**，多图自动编号）：

@@ -19,6 +19,22 @@ export const SELECTORS = {
   // `.first()` 会随 DOM 顺序命中"照片"输入框 → 文件被接收但 chip 不出现 → 报 attachment-not-confirmed。
   fileInput: '#upload-files',
   fileInputFallback: "input[type='file']:not([accept])",
+  // 生图结果里的图片元素（只有**前台**标签页才会渲染，见 references/chatgpt-dom.md §7）
+  generatedImage: "img[src*='estuary/content'], img[src*='/backend-api/']",
+  // 图片的原生下载入口。2026-09-20 实测：当前 UI **没有**这个按钮
+  // （图片 overlay 只有 编辑图片 / 分享此图片；会话"更多操作"里也没有下载），
+  // 所以走 native 模式会如实返回 NATIVE_ACTION_UNAVAILABLE —— 留着它是因为 UI 一旦加上就能用。
+  // 注意必须排除无关的"下载应用"（Download app）按钮：宽匹配 */下载/ 会命中它，
+  // 于是点了它、等 download 事件超时，错报成 DOWNLOAD_EVENT_TIMEOUT（实测踩到过）。
+  imageDownloadButton: [
+    "button[data-testid*='download' i]",
+    "button[aria-label='下载']",
+    "button[aria-label='Download']",
+    "button[aria-label*='下载图片']",
+    "button[aria-label*='Download image']",
+    "[data-testid^='image-gen-overlay'] button[aria-label*='下载']",
+    "[data-testid^='image-gen-overlay'] button[aria-label*='Download']",
+  ].join(', '),
 };
 
 // 附件 chip 检测。

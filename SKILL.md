@@ -202,6 +202,20 @@ node <skill>/scripts/chatgpt.mjs image download --all       # 收所有已出图
 node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：start → wait → download
 ```
 
+**取图有三条路，默认必须是 API（`--mode api`）**：
+
+| mode | 怎么拿 | 代价 | 什么时候用 |
+|---|---|---|---|
+| `api`（默认） | 会话 JSON 的 `image_asset_pointer` → `/files/<id>/download` → `download_url` | 不碰页面、不依赖前台；~2s | **默认，无人值守** |
+| `dom` | 前台渲染出的 `<img src=…estuary/content?id=…>` → 只用 cookie 取字节 | **要抢前台**（`--allow-ui`），冷加载要轮询最多 ~25s，实测整次 50s | API 失效 / 要核对"浏览器自己加载的字节" |
+| `native` | 点原生"下载"按钮 + 接 download 事件 | 同上 + 依赖按钮存在 | 当前 UI **没有**该按钮 → 会如实返回 `NATIVE_ACTION_UNAVAILABLE` |
+
+- 三条路的字节实测**完全一致**（同 SHA-256），所以 `--mode dom` 是可信的对照/兜底，
+  但**不要**把它当主链路：它会抢用户焦点、滚动、切会话。
+- `--mode auto` = 先 api；只有一张都没拿到**且**显式加了 `--allow-ui` 才退到 dom。
+  **绝不静默走 native 点击。**
+- UI 路径要独占窗口：会抢全局锁（占用时返回 `status: busy`）。
+
 规则（照此执行，不要自己发明流程）：
 
 - **可以连续开**：`start` 返回后立刻可以 `start` 下一个新会话，生成在服务端并行；
@@ -211,8 +225,9 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
   所以只 start 不收图会把名额占满。
 - `urlStable: false`（极少数情况下 30s 内仍是临时 `WEB:` id）→ 如实转述，别把它当稳定入口。
 - 收图**不需要**点回那个会话：`image download` 按会话 id 读会话 JSON 并下载。
-  这是**故意**不用 DOM 的：实测会话被切走后页面里根本没有图片元素（只有空的
-  `image-gen-overlay-*` 壳），抓 DOM 会得到 0 张图。
+  这是**故意**不用 DOM 的：实测后台标签页里那些 `<img>` 根本不存在（只有空的
+  `image-gen-overlay-*` 壳），而且当前 UI **没有"图片下载"按钮**（overlay 只有 编辑图片/分享此图片）。
+  前台 DOM 路径仍有（`--mode dom --allow-ui`），但慢且会抢用户焦点，只做兜底。
 - 落盘：`<CHATGPT_OUT_DIR>/<jobId>/<序号>-<服务端文件名>.<ext>` + `images.json` 元数据
   （fileId / 字节数 / 宽高 / 校验结果）。**一张图一个文件**，多张自动编号。
 - 状态语义：`ready`=有图可下；`generating`=还在生成；`text_only`=模型只回了文字（没出图，
@@ -227,8 +242,12 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
 | status / 现象 | 出口 | 动作 |
 |---|---|---|
 | `success` | commit | 进入 Step 7 |
-| `IMAGE_LIMIT_REACHED` | wait | 在途已达上限 → 先 `image download` 收掉已出图的（空位自动释放），再 start |
+| `IMAGE_LIMIT_REACHED` | wait | 在途已达上限 → 先 `image list`/`download` 观测掉已出图的（名额自动释放），再 start |
 | `IMAGE_JOB_NOT_FOUND` | repair | `image list` 确认 jobId / conversationId |
+| `FOREGROUND_REQUIRED` | ask user | `--mode dom/native` 需要抢前台 → 加 `--allow-ui`，或改用默认 `--mode api` |
+| `NATIVE_ACTION_UNAVAILABLE` | repair | 当前 UI 没有图片下载按钮 → 换 `--mode api`（或 `dom`） |
+| `IMAGE_ASSET_NOT_FOUND` | repair | 会话 JSON / 前台 DOM 里都没有该 fileId 的图 → 先 `image wait` 确认是否出图 |
+| `DOWNLOAD_EVENT_TIMEOUT` | repair | native 点击后没等到 download 事件（多半是命中/改版）；用 api/dom 兜底并记录 |
 | 生图 `text_only` | report | 模型没出图只回了文字 → 原文给用户，别假装有图 |
 | `attachment-not-confirmed` | repair | 附件 chip 没确认渲染 → 本次未发送（**不要**当成功）；看 `probe`/`attachInput` |
 | `NO_CDP` | repair | 跑 `launch`，失败则报告 |
