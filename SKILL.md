@@ -80,8 +80,9 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 
 | 动作 | 命令 | 幂等? |
 |---|---|---|
-| Connect | `launch` | ✅ 已在运行则复用 |
-| Preflight | `status` | ✅ 只读 |
+| Init（每台机器一次） | `init [--browser X --user-data-dir Y]` / `config` | ✅ 只读；`init` 不带参数只探测，带参数才写且已有绑定需 `--force` |
+| Connect | `launch` | ✅ 已在运行则复用（并验证 profile 是否匹配） |
+| Preflight | `status` / `doctor` | ✅ 只读 |
 | Context | `goto <url>` / `project <名>` | ✅ 只读定位 |
 | Context | `new` | ❌ 每次都开新会话 |
 | Compose | `send --text-file ... [--file ...]` | ❌ **重跑 = 再发一条消息** |
@@ -99,12 +100,24 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 
 ## 3｜执行流程（agent 照此调用）
 
+### Step 0｜机器级绑定（每台机器一次，不是每次调用）
+```bash
+node <skill>/scripts/chatgpt.mjs config    # 只读：现在会用哪个浏览器 / 哪个 profile，各自来自哪里
+```
+- 没绑定（`configExists: false`，或 `effective.userDataDir` 为空）→ 先 `init` 探测，再显式绑定：
+  `init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>" [--profile-directory Default]`。
+- **不要**为了省事让用户"再登录一次"：同一账号在多处重复登录容易触发风控；
+  优先复用用户**已有**的登录 profile（写进 `~/.chatgpt-web/config.json`，机器专属、不进 git）。
+- 绑定是显式的：已有绑定要改必须加 `--force`；skill 不会自动改，也不会偷偷换 profile。
+
 ### Step 1｜Preflight
 ```bash
 node <skill>/scripts/chatgpt.mjs launch
 node <skill>/scripts/chatgpt.mjs status      # 必须看到 loggedIn: true
 ```
 `loggedIn: false` → **停下**，让用户在那个被打开的 Chrome 窗口里登录，然后重试。不要自己想办法登录。
+`profileVerified: false` → 连上的是**别的** profile（`launch` 会拒止）；`null` → 本平台无法验证，
+可继续，但必须如实转述"没能证明用的是绑定 profile"。
 
 ### Step 1.5｜先算路由 Gate（不要凭感觉决定要不要问）
 ```bash
@@ -180,6 +193,12 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 |---|---|---|
 | `success` | commit | 进入 Step 7 |
 | `NO_CDP` | repair | 跑 `launch`，失败则报告 |
+| `CHROME_NOT_FOUND` | repair | 绑定的浏览器路径不存在或本机没有浏览器 → `init --browser <绝对路径>` |
+| `SPAWN_FAILED` / `CDP_TIMEOUT` | repair | 浏览器没起来 / 起来了但没开调试端口；先手工执行 hint 里的命令看报错 |
+| `PROFILE_MISMATCH` | **stop** | CDP 端口上跑的不是绑定 profile → **不要**把它的会话当结果；按 hint 修（换实例/改绑定） |
+| `PROFILE_IN_USE_NO_CDP` | ask user | 绑定的 profile 正被没有调试端口的浏览器占用；请用户用 hint 里的参数重启，**不许杀用户浏览器、不许换 profile** |
+| `PROFILE_IN_USE_OTHER_PORT` | ask user | 同一 profile 已被另一个可调试实例占用（hint 里有端口）；要么复用它，要么先关掉 |
+| `CONFIG_ERROR` | ask user | `~/.chatgpt-web/config.json` 坏了或要改绑定 → 修好或加 `--force`，不要绕过 |
 | `NOT_LOGGED_IN` / `auth_required` | ask user | 让用户登录，**不代劳** |
 | `no_response_started` | repair | 本次请求根本没开始生成；重新 `send` |
 | `timeout` | continue/ask | 已开始但没写完；再 `wait` 一轮，累计别超用户可接受上限 |
@@ -217,6 +236,9 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 - 发送消息、等待、读取：A2（自主执行后汇报）。
 - 上传用户文件：A1（默认执行；文件含敏感信息时先确认）。
 - 触发**分享/公开链接**、删除会话/项目、清空 Memory：A0，必须先取得明确同意。
+- **绝不杀用户的浏览器进程**、绝不静默换 profile、绝不复制/迁移 cookie：
+  profile 被占用时如实报 `PROFILE_IN_USE_*` 并请用户决定（复用还是重启）。
+- 绑定的 profile 往往是用户的日常浏览器：动它之前先说清"会在那个窗口里开会话/切标签页"。
 
 ## 6｜复盘与迭代
 
@@ -231,11 +253,14 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 
 | 项 | 值 |
 |---|---|
-| 脚本位置 | `<skill>/scripts/chatgpt.mjs`（其它环境可安装到 `~/.dsh/skills/chatgpt-web/`） |
-| 依赖 | Node ≥ 20 + `playwright-core`（`npm install` 于 skill 目录，离线可用） |
-| 浏览器 | 自动化专用 Chrome profile：`~/.chatgpt-web/profile` |
-| CDP | `http://127.0.0.1:9444`（`CHATGPT_CDP_PORT` 可改） |
-| 为什么独立 profile | 运行中的 Chrome 无法事后开启 CDP；Chrome 136+ 禁止默认 profile 开调试端口。独立实例同时避免与其它 debugger 控制方抢占 |
+| 脚本位置 | `<skill>/scripts/chatgpt.mjs`（安装到 `$DSH_HOME/skills/chatgpt-web/`，`DSH_HOME` 未设时为 `~/.dsh/skills/`） |
+| 依赖 | Node ≥ 20 + `playwright-core`（在 skill 目录 `npm install`，离线可用） |
+| **机器级绑定** | `~/.chatgpt-web/config.json`：`browserPath` / `userDataDir` / `profileDirectory` / `cdpPort` / `agent`（机器专属，**不进 git**） |
+| 绑定优先级 | 环境变量 > `config.json` > `<skill>/.env.agent`（宿主级实例名）> 默认值 |
+| 安装 | `node scripts/install.mjs [--dry-run] [--only dsh] [--root <skills 目录>]`（Windows 可用）；bash 版 `scripts/install.sh`（跟随 `DSH_HOME`） |
+| 浏览器 | 用 `init` 绑定的那个（Windows 上会探测 Chrome/Beta/Dev/Canary/Chromium/Edge/Brave） |
+| CDP | 默认 `http://127.0.0.1:9444`（`cdpPort` / `CHATGPT_CDP_PORT` 可改） |
+| 为什么必须显式绑定 | 运行中的 Chrome 无法事后开启 CDP；同一 user-data-dir 同时只能有一个可调试实例；Chrome 136+ 禁止默认 user-data-dir 开调试端口；重复登录有风控风险 |
 
 首次使用只需登录一次，之后所有 agent 复用同一实例。
 

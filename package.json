@@ -11,15 +11,19 @@
     "COORDINATION.md",
     "THINKING.md",
     "README.md",
+    "REVIEW.md",
     "references",
     "scripts"
   ],
   "scripts": {
     "doctor": "node scripts/chatgpt.mjs doctor",
+    "init": "node scripts/chatgpt.mjs init",
+    "config": "node scripts/chatgpt.mjs config",
     "launch": "node scripts/chatgpt.mjs launch",
     "status": "node scripts/chatgpt.mjs status",
     "e2e": "node scripts/e2e-smoke.mjs",
-    "install-skills": "bash scripts/install.sh"
+    "install-skills": "node scripts/install.mjs",
+    "install-skills:bash": "bash scripts/install.sh"
   },
   "dependencies": {
     "playwright-core": "1.60.0"

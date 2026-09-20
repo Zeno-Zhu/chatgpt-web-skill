@@ -126,13 +126,68 @@ ui_changed / empty_response / no_response_started / busy`。
 **会话选择必须由上层显式声明（`new`/`goto`/`project`），不能靠隐式状态**，
 否则多任务切换时会出现"答案正确但归属错误"——这与并发串线是同一类风险。
 
-## 五、仍未解决 / 未验证（诚实清单）
+### 12. "用哪个浏览器/profile"必须是机器级显式绑定，不能由 skill 猜
+本机（Windows）实测：默认自动化 profile 没登录，而用户日常 Chrome 的另一个 user-data-dir
+里**已经登录**了 GPT。让用户在默认 profile 里再登录一次，等于**同一账号重复登录，有风控风险**；
+但若不显式绑定，skill 就会一直打开"不是用户指定的那个浏览器"，而用户看到的只是"你怎么又开了个空窗口"。
+结论：**把绑定提升为机器级显式配置**（`~/.chatgpt-web/config.json`，不进仓库），
+优先级 环境变量 > config.json > 宿主级 `.env.agent` > 默认值，且**默认值里绝不含浏览器与 profile 路径**。
 
-- **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次。已用 `doctor` 把这一步显性化。
-- **Windows / Linux 未实机验证**：`resolveChrome()` 的路径表是通用做法，但**本机只有 macOS 实测**。
+### 13. 进程状态可以"尽力验证"，但不可"假装验证"
+Windows 实测：`--remote-debugging-port` 只对应主进程，但 renderer 子进程的 cmdline 里
+**同样带** `--user-data-dir`；因此判"谁占用了这个 profile"要优先取主进程（`--type=` 缺失的那个）。
+本平台拿不到进程信息时返回 `supported:false` + `profileVerified:null`：
+`doctor` 会明说"无法验证"，**不把 unknown 当 true**。
+
+## 五、Windows 实机验证（2026-09-20，首次）
+
+环境：Windows + Chrome 153（Program Files 安装，Edge 只装在 Program Files (x86)），
+Node v24.11，skills 根目录由 `DSH_HOME` 指定（**不是** `~/.dsh/skills`），
+绑定 profile 为一个"用户已登录 GPT"的日常 user-data-dir（非默认目录）。
+
+**已实机跑通**（非推理）：`doctor` / `init`（探测）/ `config` / `launch` / `status` / `new` / `send`（带附件）/
+`wait` / `read --md` / `ask` / `model` / `route` / `method`。
+附件链路验证方式：附件里写 `SECTION-TOKEN = ALPHA-7788`，GPT 的回复里**真的把它念了回来**，
+说明附件确实送达并被读取，不是"看起来发送成功"。
+
+本轮实机发现并修掉的缺陷：
+
+| # | 缺陷 | 根因（Windows 实测） | 修法 |
+|---|---|---|---|
+| 1 | `read --json` 的 `code` 变成 `[]` | 协议信封写成 `{协议字段, ...payload}`，payload 里同名的业务字段（代码块数组）**顶掉了状态码** | 信封改为 payload 在前、协议字段在后覆盖 |
+| 2 | 带附件时 `send` 白等 10s 才回退 Enter | chip 文本先出现、上传未完成时按钮是 `aria-disabled="true"`（`disabled` 属性仍为 false），坐标点击被 UI 忽略 | 上传后轮询等按钮真正可用（`attachmentReady`），不可用则跳过点击直接 Enter；按钮确认窗口 10s→6s |
+| 3 | "没装浏览器"报成 `spawn ENOENT` | `cmdLaunch` 在 `launchChrome()` **之后**才判 `!CHROME`，而 `spawn('')` 先抛异常 | 判空前置到 spawn 之前，返回 `CHROME_NOT_FOUND` + 可操作提示 |
+| 4 | Edge 探测漏判 | 候选表只查 `%PROGRAMFILES%\Microsoft\Edge`，本机 Edge **只装在 `%ProgramFiles(x86)%`** | 候选表按 Program Files / (x86) / LocalAppData × Chrome/Beta/Dev/Canary/Chromium/Edge/Brave 展开 |
+| 5 | `install.sh` 在 Windows 装错位置 | bash 脚本 + 硬编码 `$HOME/.dsh/skills`，而本机 skills 根是 `$DSH_HOME/skills` | 新增跨平台 `scripts/install.mjs`（支持 `--root/--only/--dry-run/--agent`）；`install.sh` 改为跟随 `DSH_HOME` |
+| 6 | `.env.agent` 是死配置 | `install.sh --agent` 会写它，但**没有任何代码读它**（文档承诺的实例隔离不生效） | 新增 `config.mjs` 真正读取它（宿主级实例名，优先级低于环境变量、高于 config.json 默认值） |
+| 7 | 重跑 `init` 会静默改绑定 | 无冲突检查 | 与既有绑定不同时必须 `--force`，否则 `CONFIG_ERROR` + `conflicts` 明细 |
+
+**仍未验证 / 已知限制**：
+- 图片生成落盘（`read --save`）、Deep Research（正文在 iframe 内）、`project` 项目上下文在 Windows 上未实机验证。
+- 用户日常 profile 与自动化实例**互斥**：同一个 user-data-dir 同时只能有一个可调试实例
+  （已实测：换个实例名再用同一 profile → `PROFILE_IN_USE_OTHER_PORT`，并给出确切手工启动命令）。
+- 若用户**已经**用普通方式打开了那个 profile（没有调试端口），运行中的 Chrome 无法事后开启 CDP，
+  此时返回 `PROFILE_IN_USE_NO_CDP` 并提示用户用绑定参数重启；**skill 不会去杀用户浏览器，也不会偷偷换 profile**。
+- 默认 user-data-dir（`%LOCALAPPDATA%\Google\Chrome\User Data`）即使有 ChatGPT 登录也**不可绑定**：
+  Chrome 136+ 禁止默认目录开远程调试端口。`init` 会就此给出显式警告。
+
+### 判断"这个 profile 登录过 GPT"不能只靠 Cookies 文件
+Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`（读它报"正被另一个进程使用"），
+于是"cookie 里有 chatgpt.com 吗"会返回 **null**，而 null 很容易被误当成 false（进而推荐错的 profile）。
+改用**不依赖被锁文件**的证据：`IndexedDB\https_chatgpt.com_0.indexeddb.leveldb`
+（目录名自带 origin）+ `Local Storage\leveldb\*` 里的明文 origin。
+拿不到任何证据时如实返回 `null`（unknown），**不返回 false**。
+
+## 六、仍未解决 / 未验证（诚实清单）
+
+- **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次（或绑定用户已有的登录 profile，
+  见 `init`）。已用 `doctor` 把这一步显性化。
+- **Windows / Linux**：Windows 已实机验证（见上）；**Linux 仍未实机验证**。
 - **AppleScript 备选通道**：仅 macOS；需用户手动开启"允许 Apple 事件中的 JavaScript"；附件上传不可靠。
 - **路由阈值未校准**：`route` 的 4/2 阈值、`method` 的 7 信号映射，均来自设计推理 + 三轮压测，
   **未用真实任务回放校准**（方法见 `THINKING.md` 第 9 节）。
 - **`cancel` / `read --after`**：已在协议里定义语义，尚未实现。
 - **项目身份校验**：未用真实项目做端到端验证（当前以 URL 的 `projectId` 为权威判据）。
 - **并发实例未压测**：实例隔离逻辑已实测端口/profile 分离，但**未做多 agent 真实并发压测**。
+- **"开机即用"未落地**：目前靠用户/上层显式 `launch`。要让那个已登录 profile 在开机后自动带调试端口启动，
+  需在 Windows 上做快捷方式/登录时计划任务（参数必须与 `config` 输出一致）；本仓库不代为创建系统级任务。

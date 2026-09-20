@@ -29,8 +29,10 @@ while [ $# -gt 0 ]; do
 done
 
 # 宿主 → skill 目录（按存在与否自动筛选）
+# 注意：dsh 的 skill 根目录优先跟随 DSH_HOME（硬编码 $HOME/.dsh 会在 DSH_HOME 指向别处时装错地方）。
+DSH_BASE="${DSH_HOME:-$HOME/.dsh}"
 declare -a HOSTS=(
-  "dsh:$HOME/.dsh/skills"
+  "dsh:$DSH_BASE/skills"
   "claude:$HOME/.claude/skills"
   "codex:$HOME/.codex/skills"
   "trae:$HOME/.trae/skills"
@@ -39,7 +41,7 @@ declare -a HOSTS=(
   "workbuddy:$HOME/.workbuddy/skills"
 )
 
-FILES=(SKILL.md COORDINATION.md THINKING.md README.md package.json package-lock.json)
+FILES=(SKILL.md COORDINATION.md THINKING.md README.md REVIEW.md package.json package-lock.json)
 DIRS=(scripts references)
 
 run() {
@@ -86,12 +88,15 @@ else
 fi
 cat <<'EOF'
 
-下一步（每个宿主都要做一次）：
-  1) node <skill>/scripts/chatgpt.mjs doctor     # 预检：能否用 / 缺什么 / 下一步做什么
-  2) node <skill>/scripts/chatgpt.mjs launch     # 首次会打开一个自动化 Chrome
-  3) 让用户在那个窗口登录一次 ChatGPT（登录态长期有效）
-  4) node <skill>/scripts/chatgpt.mjs doctor     # 期望 ready: true
+下一步（每台机器一次，配置写进 ~/.chatgpt-web/config.json，不进 git）：
+  1) node <skill>/scripts/chatgpt.mjs init        # 探测本机浏览器 + "已登录 GPT 的 profile"，给出绑定命令
+  2) node <skill>/scripts/chatgpt.mjs init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>"
+  3) node <skill>/scripts/chatgpt.mjs doctor      # 期望 ready: true, profileVerified: true
+  4) node <skill>/scripts/chatgpt.mjs launch      # 打开/复用那个已登录的浏览器实例
 
-多 agent 并行（可选）：给每个宿主不同的实例名，profile/端口/锁会全部隔离
-  export CHATGPT_AGENT=trae
+Windows 提示：没有 bash 时用 Node 版安装器（等价能力）
+  node scripts/install.mjs [--dry-run] [--only dsh] [--root <skills 目录>] [--agent trae]
+
+多宿主并行：给不同宿主不同实例名（--agent trae）→ profile 目录名/端口/锁隔离；
+但同一个已登录 profile 同时只能有一个可调试实例，共用同一 profile 时不要改实例名。
 EOF

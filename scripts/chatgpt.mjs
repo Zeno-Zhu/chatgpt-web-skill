@@ -7,7 +7,13 @@ import path from 'node:path';
 import {
   launchChrome, connect, getPage, isLoggedIn, waitForCompletion, acquireLock, releaseLock,
   SELECTORS, sleep, convIds, readTabs, writeTabs, cdpAlive, CDP_URL, PROFILE, AGENT, CDP_PORT, CHROME,
+  BINDING, SKILL_DIR, PROFILE_DIRECTORY, CHROME_SOURCE, CHROME_MISSING, checkCdpProfile,
+  listInstalledBrowsers,
 } from './lib.mjs';
+import {
+  CONFIG_FILE, readConfig, writeConfig, describeBinding, detectProfiles, resolveBinding,
+} from './config.mjs';
+import { scanBrowserProcesses, samePath } from './procs.mjs';
 
 const OUT_DIR = process.env.CHATGPT_OUT_DIR || path.join(process.cwd(), 'chatgpt-out');
 const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
@@ -51,12 +57,18 @@ const STATES = {
   auth_required: 'FAILED', rate_limit: 'FAILED', network_error: 'FAILED',
   ui_changed: 'FAILED', empty_response: 'FAILED', no_response_started: 'FAILED',
   NOT_LOGGED_IN: 'FAILED', NO_CDP: 'FAILED',
+  // 机器级绑定相关（见 config.mjs）：不猜、不降级，如实上报，让用户决定
+  CHROME_NOT_FOUND: 'FAILED', SPAWN_FAILED: 'FAILED', CDP_TIMEOUT: 'FAILED',
+  PROFILE_MISMATCH: 'FAILED', PROFILE_IN_USE_NO_CDP: 'FAILED', PROFILE_IN_USE_OTHER_PORT: 'FAILED',
+  CONFIG_ERROR: 'FAILED',
 };
 
 function envelope(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const code = obj.status || obj.error || (obj.ok === false ? 'failed' : 'success');
-  return {
+  // 协议字段必须**覆盖** payload：payload 里同名的业务字段会顶掉协议状态码
+  // （2026-09-20 实测：read 的 code 是代码块数组，于是 `code` 变成了 []，状态码被吃掉）。
+  const protocol = {
     protocol_version: PROTOCOL_VERSION,
     ok: obj.ok !== false,
     code: String(code),
@@ -64,8 +76,8 @@ function envelope(obj) {
     request_id: obj.requestId ?? null,
     project_id: obj.projectId ?? null,
     conversation_id: obj.conversationId ?? null,
-    ...obj,
   };
+  return { ...obj, ...protocol };
 }
 
 function emit(obj, args) {
@@ -96,6 +108,19 @@ const js = {
     send: !!document.querySelector("button[data-testid='send-button']"),
     stop: !!document.querySelector("button[data-testid='stop-button']"),
   }),
+  // 发送按钮是否被 UI 判为不可用。
+  // 2026-09-20 实测（Windows）：附件 chip 文本先出现、上传还没完成时，
+  // 按钮 `disabled` 属性是 false 但 `aria-disabled="true"` —— 此时坐标点击会被忽略，
+  // 必须等它变可用再点，或直接走 Enter（编辑器自身的提交路径）。
+  sendBlocked: () => {
+    const btn = document.querySelector("button[data-testid='send-button']");
+    if (!btn) return null;
+    return {
+      disabledAttr: !!btn.disabled,
+      ariaDisabled: btn.getAttribute('aria-disabled') === 'true',
+      disabled: !!(btn.disabled || btn.getAttribute('aria-disabled') === 'true'),
+    };
+  },
   lastAssistant: () => {
     const turns = [...document.querySelectorAll("[data-testid^='conversation-turn-']")];
     const last = turns[turns.length - 1];
@@ -126,14 +151,58 @@ async function withPage(fn, { create = true } = {}) {
 
 async function cmdLaunch(args) {
   const r = await launchChrome({ headless: args.headless === true });
-  if (r.reason === 'already-running') return { ok: true, launched: false, cdp: CDP_URL };
-  if (!r.ok && !CHROME) {
+  const base = {
+    cdp: CDP_URL, browser: CHROME, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileSource: BINDING.sources.userDataDir,
+    agent: AGENT, configFile: BINDING.file,
+  };
+
+  if (r.reason === 'already-running') {
+    return { ok: true, launched: false, profileVerified: r.profileVerified ?? null, ...base };
+  }
+  if (r.reason === 'chrome-not-found') {
     return {
-      ok: false, error: 'chrome-not-found', platform: process.platform,
-      hint: '没找到 Chrome/Chromium。装一个浏览器，或用 CHATGPT_CHROME=<可执行文件绝对路径> 指定。',
+      ok: false, error: 'CHROME_NOT_FOUND', platform: process.platform, ...base,
+      hint: CHROME_MISSING
+        ? `绑定的浏览器路径不存在：${BINDING.keys.browserPath}。用 init 重新绑定，或修正 ${BINDING.file}`
+        : '没找到 Chrome/Chromium/Edge。装一个浏览器，或用 init --browser <绝对路径> 绑定。',
     };
   }
-  return { ok: r.ok, launched: true, cdp: CDP_URL, profile: PROFILE, agent: AGENT };
+  if (r.reason === 'profile-mismatch') {
+    return {
+      ok: false, error: 'PROFILE_MISMATCH', ...base,
+      liveProfile: r.liveProfile, liveProfileDirectory: r.liveProfileDirectory,
+      hint: `CDP ${CDP_URL} 上跑的不是绑定的 profile。要么关掉那个实例（不要杀用户日常浏览器），要么把它启动成绑定的 profile：init --user-data-dir "${PROFILE}"`,
+    };
+  }
+  if (r.reason === 'profile-in-use') {
+    const holderPort = r.holder?.cdpPort ?? null;
+    const manual = `"${CHROME}" --remote-debugging-port=${CDP_PORT} --user-data-dir="${PROFILE}"`
+      + (PROFILE_DIRECTORY ? ` --profile-directory=${PROFILE_DIRECTORY}` : '');
+    return {
+      ok: false,
+      error: holderPort ? 'PROFILE_IN_USE_OTHER_PORT' : 'PROFILE_IN_USE_NO_CDP',
+      holderCdpPort: holderPort,
+      holder: r.holder ? { commandLine: r.holder.commandLine } : null,
+      ...base,
+      hint: holderPort
+        ? `绑定的 profile 已被另一个可调试实例占用（端口 ${holderPort}，不是本实例的 ${CDP_PORT}）。`
+          + `同一个 profile 同时只能有一个可调试实例：要么关掉那个实例，要么让本实例复用端口 ${holderPort}`
+          + `（多宿主共享同一个 profile 时不要用不同 agent 名）。手工启动： ${manual}`
+        : `绑定的 profile 正被一个没有调试端口的浏览器占用，再启动也拿不到 CDP。`
+          + `请让用户用绑定参数重启那个实例（或先关掉它），不要杀掉用户的日常浏览器。手工启动： ${manual}`,
+    };
+  }
+  if (r.reason === 'spawn-failed') {
+    return { ok: false, error: 'SPAWN_FAILED', detail: r.detail, ...base, hint: '浏览器没能启动，先手工执行一次看报错' };
+  }
+  if (r.reason === 'cdp-timeout') {
+    return {
+      ok: false, error: 'CDP_TIMEOUT', ...base,
+      hint: `浏览器进程起来了但 ${CDP_URL} 没开（可能同一个 profile 已被别的实例占用，或调试端口被策略禁用）`,
+    };
+  }
+  return { ok: r.ok, launched: true, profileVerified: r.profileVerified ?? null, ...base };
 }
 
 // ---------- 新机器预检 ----------
@@ -144,15 +213,41 @@ async function cmdDoctor() {
   const steps = [];
   const add = (name, status, detail, action) => steps.push({ name, status, detail, action });
 
-  // 1) 浏览器可执行文件
-  add('browser-binary', CHROME ? 'ok' : 'fail',
-    CHROME || `未找到（platform=${process.platform}）`,
-    CHROME ? null : '安装 Chrome，或设置 CHATGPT_CHROME=/path/to/chrome');
+  // 0) 机器级绑定：决定"用哪个浏览器 + 哪个已登录 profile"（这是本 skill 最容易被搞错的一环）
+  const cfg = readConfig(BINDING.file);
+  add('binding-config', cfg.error ? 'fail' : (cfg.exists ? 'ok' : 'warn'),
+    cfg.error ? `${BINDING.file}：${cfg.error}`
+      : (cfg.exists ? BINDING.file : `没有机器配置，正在用 env/默认值：${BINDING.file}`),
+    cfg.error ? '修好这个 JSON，或删掉它重新 init'
+      : (cfg.exists ? null : 'chatgpt-web init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>"'));
 
-  // 2) CDP 实例
+  add('browser-binding', CHROME && !CHROME_MISSING ? 'ok' : 'fail',
+    `${CHROME || '未绑定'}（source=${CHROME_SOURCE}）`,
+    CHROME && !CHROME_MISSING ? null : 'chatgpt-web init --browser "<chrome.exe 绝对路径>"');
+
+  add('profile-binding', BINDING.keys.userDataDir ? 'ok' : 'warn',
+    `${PROFILE}${PROFILE_DIRECTORY ? `（--profile-directory=${PROFILE_DIRECTORY}）` : ''}（source=${BINDING.sources.userDataDir}）`,
+    BINDING.keys.userDataDir ? null
+      : '默认 profile 需要用户重新登录一次；想复用已登录的浏览器就跑 chatgpt-web init --user-data-dir "<那个 profile 目录>"');
+
+  // 1) CDP 实例 + 它用的 profile 是否就是绑定的那个
   const alive = await cdpAlive();
   add('cdp-instance', alive ? 'ok' : 'fail', `${CDP_URL}（agent=${AGENT}, port=${CDP_PORT}）`,
     alive ? null : '运行: chatgpt-web launch');
+
+  let profileCheck = { supported: false, liveProfile: null, matched: null };
+  if (alive) {
+    profileCheck = checkCdpProfile();
+    const st = profileCheck.matched === true ? 'ok' : (profileCheck.matched === false ? 'fail' : 'unknown');
+    add('profile-match', st,
+      profileCheck.matched === true ? `CDP 实例用的正是绑定 profile（${profileCheck.liveProfile}）`
+        : profileCheck.matched === false ? `CDP 实例用的是 ${profileCheck.liveProfile}，不是绑定的 ${PROFILE}`
+          : (profileCheck.supported ? '无法确定该实例用的是哪个 profile'
+            : `本平台（${process.platform}）拿不到浏览器进程信息，无法验证`),
+      profileCheck.matched === true ? null
+        : (profileCheck.matched === false ? '先把那个实例换成绑定 profile（见 launch 的 hint），或修正绑定'
+          : '可以继续，但 doctor 无法证明"用的就是这个 profile"'));
+  }
 
   // 3) 自动化 profile
   const profileExists = fs.existsSync(PROFILE);
@@ -195,29 +290,45 @@ async function cmdDoctor() {
   }
 
   const blocking = steps.filter((s) => s.status === 'fail' || s.status === 'needs-user');
-  const ready = loggedIn && !!CHROME;
+  const warnings = steps.filter((s) => s.status === 'warn' || s.status === 'unknown').map((s) => s.name);
+  const ready = loggedIn && !!CHROME && !CHROME_MISSING;
   return {
-    ok: true, ready, agent: AGENT, port: CDP_PORT, profile: PROFILE, currentUrl,
+    ok: true, ready, canRun: ready, agent: AGENT, port: CDP_PORT,
+    browser: CHROME || null, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileVerified: profileCheck.matched,
+    configFile: BINDING.file, binding: BINDING.keys, bindingSources: BINDING.sources,
+    bindingTable: describeBinding(BINDING), warnings, currentUrl,
     verdict: ready
       ? 'READY：可以直接调用网页版 GPT'
-      : (CHROME ? 'NEEDS-USER-ACTION：需要用户完成一次登录' : 'NOT-READY：先解决浏览器缺失'),
+      : (CHROME && !CHROME_MISSING ? 'NEEDS-USER-ACTION：需要用户完成一次登录' : 'NOT-READY：先解决浏览器/profile 绑定'),
     nextAction: ready
       ? 'chatgpt-web ask --text-file <prompt> --json'
-      : (!CHROME ? '安装 Chrome，或设置 CHATGPT_CHROME'
+      : ((!CHROME || CHROME_MISSING)
+        ? 'chatgpt-web init --browser "<chrome.exe 绝对路径>" --user-data-dir "<已登录 GPT 的 profile 目录>"'
         : (!alive ? 'chatgpt-web launch' : '让用户在弹出的 Chrome 窗口登录 ChatGPT，然后重跑 doctor')),
     blocking, steps,
   };
 }
 
 async function cmdStatus() {
+  const binding = {
+    browser: CHROME || null, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileSource: BINDING.sources.userDataDir,
+    port: CDP_PORT, agent: AGENT, configFile: BINDING.file,
+  };
   const alive = await cdpAlive();
-  if (!alive) return { ok: false, cdp: false, hint: 'node scripts/chatgpt.mjs launch' };
+  if (!alive) return { ok: false, cdp: false, ...binding, hint: 'node scripts/chatgpt.mjs launch' };
+  const check = checkCdpProfile();
   return withPage(async (page) => {
     const loggedIn = await isLoggedIn(page);
     const url = page.url();
     const ids = convIds(url);
     const title = await page.title();
-    return { ok: true, cdp: true, loggedIn, url, title, ...ids };
+    return {
+      ok: true, cdp: true, loggedIn, url, title,
+      profileVerified: check.matched, liveProfile: check.liveProfile,
+      ...binding, ...ids,
+    };
   });
 }
 
@@ -325,6 +436,7 @@ async function cmdSend(args) {
     const before = await page.locator(SELECTORS.assistant).count();   // assistant 消息数基线（无歧义）
 
     let uploaded = [];
+    let attachmentReady = null;
     if (files.length) {
       const abs = files.map((f) => path.resolve(f));
       for (const f of abs) if (!fs.existsSync(f)) return { ok: false, error: 'file-not-found', file: f };
@@ -362,6 +474,15 @@ async function cmdSend(args) {
         };
       }
       await sleep(800);
+      // chip 出现 ≠ 上传完成：上传未完成时发送按钮是 aria-disabled（disabled 属性仍是 false），
+      // 此时坐标点击会被 UI 直接忽略（2026-09-20 Windows 实测：带附件必然走到 Enter 兜底并白等 10s）。
+      // 所以这里等按钮真正可用；等不到也不硬等，如实记录 ready=false 后走 Enter。
+      attachmentReady = false;
+      for (let i = 0; i < 40; i++) {            // 最长 20s
+        const b = await page.evaluate(js.sendBlocked);
+        if (!b || !b.disabled) { attachmentReady = true; break; }
+        await sleep(500);
+      }
     }
 
     if (text) {
@@ -399,9 +520,14 @@ async function cmdSend(args) {
     const attempts = [];
     let submitted = false;
     const send = page.locator(SELECTORS.send).first();
-    if (await send.count()) {
+    const btnState = await page.evaluate(js.sendBlocked);
+    if (btnState && btnState.disabled) {
+      // 按钮被 UI 判为不可用（附件还在上传等）：点击是空转，直接走 Enter ——
+      // Enter 走编辑器自身的提交路径，实测能提交且附件确实送达。
+      attempts.push({ via: 'button', skipped: 'aria-disabled', attachmentReady });
+    } else if (await send.count()) {
       await send.click({ force: true }).catch((e) => attempts.push('click-error:' + e.message));
-      const r = await confirm(20);
+      const r = await confirm(12);            // 6s：点击被浮层/状态吃掉时快速回退，不再干等 10s
       attempts.push({ via: 'button', ...r });
       submitted = r.ok;
     }
@@ -442,6 +568,7 @@ async function cmdSend(args) {
     const result = {
       ok: submitted, submitted, attempts,
       uploaded, uploadedCount: uploaded.length,
+      attachmentReady,
       baselineAssistant: before,
       pendingText: submitted ? '' : await page.evaluate(js.composerText),
       url, ...ids, turnsBefore: before,
@@ -497,7 +624,7 @@ async function cmdRead(args) {
     const full = last.text || '';
     const truncated = maxChars > 0 && full.length > maxChars;
     const text = truncated ? full.slice(0, maxChars) : full;
-    const out = { ok: true, text, ...convIds(page.url()), turnIndex: last.turnIndex,
+    const out = { ok: true, text, url: page.url(), ...convIds(page.url()), turnIndex: last.turnIndex,
       images: last.imgs.map((i) => i.src), codeBlocks: last.codes.length,
       code: last.codes.map((c) => ({ lang: c.lang, bytes: c.text.length })),
       responseChars: full.length, readChars: text.length, truncated,
@@ -756,21 +883,157 @@ async function cmdAsk(args) {
   return {
     ok: true,
     url: send.url, projectId: send.projectId, conversationId: send.conversationId,
-    uploaded: send.uploaded, elapsedMs: wait.elapsedMs, viaFallback: wait.viaFallback,
+    uploaded: send.uploaded, attempts: send.attempts, attachmentReady: send.attachmentReady,
+    pendingText: send.pendingText,
+    elapsedMs: wait.elapsedMs, viaFallback: wait.viaFallback,
     text: read.text, images: read.images, codeBlocks: read.codeBlocks,
     savedImages: read.savedImages, savedMarkdown: read.savedMarkdown,
   };
 }
 
+// ---------- 机器级初始化（本机专属，配置不进仓库）----------
+// 每台机器都要显式回答一次："用哪个浏览器 + 哪个**已经登录过 GPT** 的 profile"。
+// 不猜、不降级、不新建 profile 让用户重复登录：重复登录有风控风险（见 REVIEW.md）。
+async function cmdInit(args) {
+  const wantBrowser = typeof args.browser === 'string' ? args.browser : null;
+  const wantProfile = typeof args['user-data-dir'] === 'string' ? args['user-data-dir'] : null;
+  const wantProfileDir = typeof args['profile-directory'] === 'string' ? args['profile-directory'] : null;
+  const wantPort = args.port !== undefined ? Number(args.port) : undefined;
+  const wantAgent = typeof args.agent === 'string' ? args.agent : null;
+  const dryRun = args['dry-run'] === true;
+  const force = args.force === true;
+
+  const cur = readConfig(CONFIG_FILE);
+  const patch = {};
+  if (wantBrowser) patch.browserPath = wantBrowser;
+  if (wantProfile) patch.userDataDir = wantProfile;
+  if (wantProfileDir) patch.profileDirectory = wantProfileDir;
+  if (wantPort !== undefined && !Number.isNaN(wantPort)) patch.cdpPort = wantPort;
+  if (wantAgent) patch.agent = wantAgent;
+
+  // 不带参数 = 只探测并给出建议命令（探测结果含"哪个 profile 有 ChatGPT 使用痕迹"）
+  if (!Object.keys(patch).length) {
+    const scan = scanBrowserProcesses();
+    const runningDirs = scan.supported
+      ? [...new Set(scan.entries.map((e) => e.userDataDir).filter(Boolean))]
+      : [];
+    const profiles = detectProfiles({ extraDirs: runningDirs });
+    const browsers = listInstalledBrowsers();
+    // 建议优先级：非默认目录（Chrome 136+ 不给默认目录开调试端口）> 有 ChatGPT 痕迹 > 正在运行
+    const scored = profiles
+      .map((p) => ({
+        p,
+        score: (p.chatgptTrace === true ? 4 : 0) + (p.defaultUserDataDir ? -4 : 0)
+          + (runningDirs.some((d) => samePath(d, p.userDataDir)) ? 2 : 0),
+      }))
+      .sort((a, b) => b.score - a.score);
+    const best = scored.length ? scored[0].p : null;
+    const suggested = best && best.chatgptTrace === true && !best.defaultUserDataDir ? best : null;
+    return {
+      ok: true, wrote: false, configFile: CONFIG_FILE, configExists: cur.exists,
+      detected: {
+        browsers,
+        runningUserDataDirs: runningDirs,
+        profiles,
+        processScan: scan.supported ? 'supported' : `unsupported(${process.platform})`,
+      },
+      warnings: [
+        ...(profiles.some((p) => p.defaultUserDataDir && p.chatgptTrace === true)
+          ? ['检测到**默认** Chrome profile 里有 ChatGPT 痕迹：Chrome 136+ 不允许默认 user-data-dir 开调试端口，绑它连不上 CDP（要另建/指定一个非默认目录，并在其中登录一次）']
+          : []),
+        ...(profiles.some((p) => p.cookiesLocked)
+          ? ['有 profile 的 Cookies 正被运行中的浏览器独占，只能用无锁痕迹（IndexedDB/Local Storage）判断']
+          : []),
+      ],
+      suggestion: suggested
+        ? {
+          browserPath: browsers[0] || null,
+          userDataDir: suggested.userDataDir,
+          profileDirectory: suggested.profileDirectory,
+          evidence: suggested.chatgptEvidence,
+          reason: '这个 profile 有 ChatGPT 使用痕迹，且不是默认目录（能开调试端口）',
+        }
+        : null,
+      nextAction: suggested
+        ? `chatgpt-web init --browser "${browsers[0] || '<chrome.exe>'}" --user-data-dir "${suggested.userDataDir}"${suggested.profileDirectory ? ` --profile-directory "${suggested.profileDirectory}"` : ''}`
+        : '没探测到可用的"已登录且非默认目录"的 profile：请手工给出路径 init --browser <chrome.exe> --user-data-dir <已登录 GPT 的 profile 目录>',
+    };
+  }
+
+  if (cur.error) {
+    return { ok: false, error: 'CONFIG_ERROR', configFile: CONFIG_FILE, detail: cur.error, hint: '先修好这个 JSON，或删掉它再 init' };
+  }
+
+  // 显式绑定不允许被静默改掉
+  const conflicts = Object.entries(patch)
+    .filter(([k, v]) => cur.data[k] !== undefined && String(cur.data[k]) !== String(v))
+    .map(([k, v]) => ({ key: k, existing: cur.data[k], wanted: v }));
+  if (conflicts.length && !force) {
+    return {
+      ok: false, error: 'CONFIG_ERROR', configFile: CONFIG_FILE,
+      conflicts, existing: cur.data,
+      hint: '已有绑定且与本次不同：确认要改就加 --force（不会自动覆盖）',
+    };
+  }
+
+  // 路径必须真实存在，否则写进去只会让后续命令全部失败
+  const problems = [];
+  if (patch.browserPath && !fs.existsSync(patch.browserPath)) problems.push({ key: 'browserPath', value: patch.browserPath, reason: '文件不存在' });
+  if (patch.userDataDir && !fs.existsSync(patch.userDataDir)) problems.push({ key: 'userDataDir', value: patch.userDataDir, reason: '目录不存在' });
+  if (problems.length) {
+    return { ok: false, error: 'CONFIG_ERROR', problems, hint: '路径写错了？先跑 chatgpt-web init（不带参数）看探测结果' };
+  }
+
+  if (dryRun) {
+    return { ok: true, wrote: false, dryRun: true, configFile: CONFIG_FILE, wouldWrite: { ...cur.data, ...patch } };
+  }
+
+  const saved = writeConfig(patch, CONFIG_FILE);
+  const fresh = resolveBinding({ file: CONFIG_FILE, skillDir: SKILL_DIR });
+  return {
+    ok: true, wrote: true, configFile: saved.file, config: saved.data,
+    effective: fresh.keys, sources: fresh.sources,
+    nextAction: 'chatgpt-web launch && chatgpt-web doctor',
+    note: '这份配置是机器专属的，放在用户主目录，不会进 git，也不会被 skill 更新覆盖',
+  };
+}
+
+// 只读展示：现在实际会用哪个浏览器 / 哪个 profile，各自来自哪里
+async function cmdConfig() {
+  const cfg = readConfig(CONFIG_FILE);
+  const scan = scanBrowserProcesses();
+  const running = scan.supported
+    ? scan.entries.filter((e) => !e.child && e.userDataDir)
+      .map((e) => ({ userDataDir: e.userDataDir, profileDirectory: e.profileDirectory, cdpPort: e.cdpPort }))
+    : [];
+  return {
+    ok: !cfg.error,
+    error: cfg.error || undefined,
+    configFile: CONFIG_FILE, configExists: cfg.exists, config: cfg.data,
+    effective: BINDING.keys, sources: BINDING.sources, table: describeBinding(BINDING),
+    envOverrides: Object.fromEntries(Object.entries(BINDING.sources).filter(([, s]) => String(s).startsWith('env:'))),
+    runningInstances: running,
+    processScan: scan.supported ? 'supported' : `unsupported(${process.platform})`,
+    detectedBrowsers: listInstalledBrowsers(),
+    hint: cfg.exists ? null : '还没有机器配置：chatgpt-web init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>"',
+  };
+}
+
 const CMDS = { launch: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
   new: cmdNew, project: cmdProject, send: cmdSend, wait: cmdWait, read: cmdRead,
-  model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor };
+  model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
+  init: cmdInit, config: cmdConfig };
 
 const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
 
   doctor                       新机器预检：能否用 / 缺什么 / 下一步做什么（先跑这个）
+  init [--browser <exe>] [--user-data-dir <dir>] [--profile-directory <名>]
+                               机器级绑定（本机专属，不进 git）：用哪个浏览器 + 哪个已登录 GPT 的 profile
+                               不带参数 = 只探测（列出本机浏览器 / 正在运行的 profile / 哪个 profile 有 chatgpt cookie）
+                               已有绑定且不同时不会自动覆盖，要改加 --force；--dry-run 只预览
+  config                       只读展示当前绑定：实际用哪个浏览器/profile、各自来自哪里
   launch                       启动/复用自动化 Chrome（CDP ${CDP_URL}）
-  status                       连接状态 + 登录态 + 当前会话 id
+  status                       连接状态 + 登录态 + 绑定 + 当前会话 id
   tabs                         列出标签页
   goto <url>                   打开指定会话/项目 URL
   new                          新聊天
@@ -798,12 +1061,18 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   --request-id X  幂等键：同一 id 重复 send 不会重复发送
   --max-chars N   read 返回上限（默认 4000，原文更长时截断并给出 readRatio）
   --save          落盘图片（写到 CHATGPT_OUT_DIR）
-环境：
-  CHATGPT_AGENT     实例名（如 trae）→ profile/端口/锁全部隔离，多 agent 可并行
-  CHATGPT_CHROME    指定浏览器可执行文件（默认按平台自动探测）
-  CHATGPT_CDP_PORT  覆盖端口
-  CHATGPT_PROFILE   覆盖 profile 目录
-  CHATGPT_OUT_DIR   产物落盘目录`;
+环境（优先级：环境变量 > ~/.chatgpt-web/config.json > <skill>/.env.agent > 默认值）：
+  CHATGPT_AGENT       实例名（如 trae）→ profile 目录名/端口/锁全部隔离，多 agent 可并行
+  CHATGPT_CHROME      浏览器可执行文件；不设时按平台探测（也可以写进 config.json 的 browserPath）
+  CHATGPT_PROFILE     **已经登录过 GPT** 的 user-data-dir（写进 config.json 的 userDataDir 更持久）
+  CHATGPT_PROFILE_DIRECTORY  user-data-dir 里的 profile 名（Default / Profile 1 …）
+  CHATGPT_CDP_PORT    覆盖端口
+  CHATGPT_CONFIG      覆盖 config.json 路径
+  CHATGPT_OUT_DIR     产物落盘目录
+
+绑定命令：chatgpt-web init            # 探测本机可用的浏览器与已登录 profile，给出建议命令
+          chatgpt-web init --browser "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" \\
+                           --user-data-dir "D:\\ChromeProfiles\\GPT"`;
 
 async function main() {
   const argv = process.argv.slice(2);
