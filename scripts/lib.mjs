@@ -39,6 +39,44 @@ export const PROFILE_DIRECTORY = BINDING.keys.profileDirectory || null;export co
 export const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 export const TABS_FILE = path.join(STATE_DIR, `tabs${SCOPE}.json`);
 
+// ---------- 用户传入路径的规范化（跨 shell 安全）----------
+// 2026-09-22 实测：在 Git Bash 里把 `/c/Users/x` 交给 Windows 版 node，它会被当成"当前盘符的相对路径"，
+// `path.resolve` 得到 `C:\c\Users\x` —— 产物**静默**写到错误位置，调用方毫无察觉
+// （`read --md` 返回的 savedMarkdown 也是那个坏路径）。
+// 只转换 `/单字母/` 这种确定是 MSYS 盘符的形式，不碰 `/usr/share` 这类真正的根路径。
+export function normalizeUserPath(p) {
+  if (typeof p !== 'string' || !p) return p;
+  if (process.platform !== 'win32') return p;
+  const m = /^\/([a-zA-Z])\/(.*)$/.exec(p);
+  return m ? `${m[1].toUpperCase()}:/${m[2]}` : p;
+}
+
+// Windows 上输出目录必须是**盘符绝对路径**。不是就明确报错，而不是让它被解析到
+// `<当前盘符>\...` 之后静默写错地方（这正是上面那个坑里"静默"的那一半）。
+// 抛出的错误由 chatgpt.mjs 的 main() 兜住，转成 `{ ok:false, error }` 信封。
+export function requireDriveAbsolute(p, what = '路径') {
+  if (process.platform !== 'win32') return p;
+  const s = String(p == null ? '' : p);
+  if (/^[a-zA-Z]:[\\/]/.test(s)) return s;
+  throw new Error(
+    `PATH_NOT_DRIVE_ABSOLUTE: ${what} "${s}" 在 Windows 上必须是盘符绝对路径（如 C:/Users/me/out）。`
+    + ' Git Bash 的 /c/... 会被自动纠正；"\\\\" 开头或 /tmp/... 这类会被解析成 <当前盘符>:\\tmp\\...，故直接拒绝。',
+  );
+}
+
+// 在基础层统一纠正 CHATGPT_OUT_DIR：它必须在任何消费方（chatgpt.mjs / images.mjs）读取之前生效，
+// 所以放在这里而不是各命令内部 —— 否则 images.mjs 在 import 期就算好了旧值。
+{
+  const rawOut = process.env.CHATGPT_OUT_DIR;
+  if (rawOut) {
+    const fixedOut = normalizeUserPath(rawOut);
+    if (fixedOut !== rawOut) {
+      process.env.CHATGPT_OUT_DIR = fixedOut;
+      process.stderr.write(`[chatgpt-web] CHATGPT_OUT_DIR: ${rawOut} → ${fixedOut}（Git Bash 盘符形式已纠正）\n`);
+    }
+  }
+}
+
 // 跨平台定位 Chrome：先看显式环境变量，再按平台探测常见安装位置。
 // 返回 null 表示没找到——由上层给出可操作提示，而不是抛一个看不懂的错误。
 function winCandidates() {
@@ -241,11 +279,20 @@ export async function openNewChat(page) {
   return page;
 }
 
-export async function isLoggedIn(page) {
-  if (await page.locator(SELECTORS.composer).count()) return true;
-  const url = page.url();
-  if (/auth\.openai\.com|\/auth\/login/.test(url)) return false;
-  return false;
+// 登录判定 = composer 是否可用。
+//
+// 2026-09-22 实测：新标签页 / 刚导航完时 composer 还没渲染，**立刻**判定会误报 NOT_LOGGED_IN，
+// 而用户其实是登录着的。所以允许调用方给一个就绪等待窗口（waitMs），窗口内轮询而非一锤定音。
+// 反向证据优先：URL 已经落到登录页时立刻下结论，不必把窗口等满。
+// 默认 waitMs = 0 —— 保持既有调用点的延迟不变；只有诊断类命令（status / doctor）显式传窗口。
+export async function isLoggedIn(page, { waitMs = 0, stepMs = 500 } = {}) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    if (await page.locator(SELECTORS.composer).count().catch(() => 0)) return true;
+    if (/auth\.openai\.com|\/auth\/login/.test(page.url())) return false;
+    if (Date.now() >= deadline) return false;
+    await sleep(stepMs);
+  }
 }
 
 // 单次采样：所有判定都绑定在"本次新增的 assistant 消息"上，不做全页面查询。
