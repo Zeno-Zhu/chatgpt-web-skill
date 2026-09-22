@@ -8,7 +8,7 @@ import {
   launchChrome, connect, getPage, isLoggedIn, waitForCompletion, acquireLock, releaseLock,
   sleep, convIds, readTabs, writeTabs, cdpAlive, CDP_URL, PROFILE, AGENT, CDP_PORT, CHROME,
   BINDING, SKILL_DIR, PROFILE_DIRECTORY, CHROME_SOURCE, CHROME_MISSING, checkCdpProfile,
-  listInstalledBrowsers, openNewChat,
+  listInstalledBrowsers, openNewChat, normalizeUserPath, requireDriveAbsolute,
 } from './lib.mjs';
 import {
   CONFIG_FILE, readConfig, writeConfig, describeBinding, detectProfiles, resolveBinding,
@@ -28,6 +28,11 @@ const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 const REQ_DIR = path.join(STATE_DIR, 'requests');
 const PROTOCOL_VERSION = 1;
 
+// 登录判定允许的就绪等待窗口（见 lib.mjs isLoggedIn）：
+// 新标签页 composer 还没渲染时会误报未登录（2026-09-22 实测），诊断类命令给一个窗口再下结论。
+// 0 = 只探一次；可用 CHATGPT_LOGIN_WAIT_MS 覆盖。
+const LOGIN_WAIT_MS = Number(process.env.CHATGPT_LOGIN_WAIT_MS || 6000);
+
 // Token 预算（由与 GPT 的设计讨论确定：按字符，不按行；行数无意义）
 const BUDGET = {
   promptSoft: 6000,    // prompt 正文软上限（字符）
@@ -38,6 +43,8 @@ const BUDGET = {
 
 // 可重复出现的参数：--file a --file b 必须收集成数组，不能被当成彼此的值
 const REPEATABLE = new Set(['file', 'model-name']);
+// 当路径用的参数：Git Bash 的 /c/... 交给 Windows 版 node 会被解析到 C:\c\...，在这里统一纠正
+const PATH_ARGS = new Set(['text-file', 'file', 'out']);
 
 function parseArgs(argv) {
   const out = { _: [] };
@@ -47,7 +54,8 @@ function parseArgs(argv) {
       const k = a.slice(2);
       if (k.startsWith('no-')) { out[k.slice(3)] = false; continue; }
       const hasVal = argv[i + 1] !== undefined && !argv[i + 1].startsWith('--');
-      const val = hasVal ? argv[++i] : true;
+      let val = hasVal ? argv[++i] : true;
+      if (PATH_ARGS.has(k) && typeof val === 'string') val = normalizeUserPath(val);
       if (REPEATABLE.has(k)) {
         if (!Array.isArray(out[k])) out[k] = out[k] === undefined ? [] : [out[k]];
         out[k].push(val);
@@ -222,7 +230,9 @@ async function cmdDoctor() {
   let currentUrl = null;
   if (alive) {
     try {
-      const r = await withPage(async (page) => ({ loggedIn: await isLoggedIn(page), url: page.url() }));
+      const r = await withPage(async (page) => ({
+        loggedIn: await isLoggedIn(page, { waitMs: LOGIN_WAIT_MS }), url: page.url(),
+      }));
       loggedIn = !!r.loggedIn;
       currentUrl = r.url;
       add('logged-in', loggedIn ? 'ok' : 'needs-user', loggedIn ? `已登录（${r.url}）` : '未登录',
@@ -283,7 +293,8 @@ async function cmdStatus() {
   if (!alive) return { ok: false, cdp: false, ...binding, hint: 'node scripts/chatgpt.mjs launch' };
   const check = checkCdpProfile();
   return withPage(async (page) => {
-    const loggedIn = await isLoggedIn(page);
+    // 给 composer 一个就绪窗口再判定：新标签页瞬时判定会误报未登录（2026-09-22 实测）
+    const loggedIn = await isLoggedIn(page, { waitMs: LOGIN_WAIT_MS });
     const url = page.url();
     const ids = convIds(url);
     const title = await page.title();
@@ -535,7 +546,9 @@ async function cmdRead(args) {
       out.truncatedHint = `仅返回前 ${maxChars} 字符（原文 ${full.length}）。需要更多请用 --max-chars，或按段再读`;
     }
     if (saveImages && last.imgs.length) {
-      fs.mkdirSync(OUT_DIR, { recursive: true });
+      // 落盘前钉死输出目录：Windows 上必须是盘符绝对路径，
+      // 否则会被解析到 <当前盘符>\... 静默写错地方（2026-09-22 实测）
+      fs.mkdirSync(requireDriveAbsolute(OUT_DIR, 'CHATGPT_OUT_DIR'), { recursive: true });
       const saved = [];
       for (const im of last.imgs) {
         if (!/^https?:/.test(im.src)) continue;
@@ -552,7 +565,7 @@ async function cmdRead(args) {
       out.savedImages = saved;
     }
     if (args.md) {
-      fs.mkdirSync(OUT_DIR, { recursive: true });
+      fs.mkdirSync(requireDriveAbsolute(OUT_DIR, 'CHATGPT_OUT_DIR'), { recursive: true });
       const f = path.join(OUT_DIR, `answer-${Date.now()}.md`);
       fs.writeFileSync(f, last.text);   // 落盘始终写全文，预算只约束返回给 agent 的部分
       out.savedMarkdown = f;
@@ -930,7 +943,8 @@ async function cmdConfig() {
 async function cmdImage(args) {
   const sub = args._[0];
   const store = loadJobs();
-  const outDir = path.resolve(args.out || OUT_DIR);
+  // 同样钉死输出目录：--out 与 CHATGPT_OUT_DIR 都必须是盘符绝对路径（Windows）
+  const outDir = requireDriveAbsolute(path.resolve(args.out || OUT_DIR), args.out ? '--out' : 'CHATGPT_OUT_DIR');
 
   const listView = async (page) => {
     const rows = [];

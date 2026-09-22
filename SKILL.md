@@ -329,3 +329,71 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
 - 不要并发在同一会话里发多条消息（会串线）；并发请用不同会话。
 - 不要用固定 `sleep` 代替 `wait` 的完成判定。
 - 不要为了"看起来完成"而截断或改写 GPT 的回答。
+
+## 9｜受限环境适配（沙箱 / Git Bash）
+
+> 这一节解决"在受限宿主里跑本 skill"的两类环境问题：**GUI 子进程被回收**、**跨 shell 路径错位**。
+> 2026-09-22 实测于 Windows + Git Bash 的沙箱环境。
+
+### 9.1｜GUI 子进程会被回收 → 全链路必须压进一次调用
+
+如果宿主会在**工具调用结束时回收子进程**（沙箱类宿主普遍如此），那么：
+- 由 `launch` 拉起的浏览器**活不过调用边界**。实测三种启动方式全部被杀：
+  bash 后台 `chrome.exe … &`、本 skill 的 `launch`、PowerShell `Start-Process`；
+- 下一次工具调用里 `netstat` 只剩 `TIME_WAIT`、浏览器进程数为 0。
+- 因此「先 `launch`，下一次调用再 `status` / `send`」**必然失败**——不是 skill 的问题，是进程被收走了。
+
+处置：把 `launch(带重试) → status 轮询就绪 → new → send → wait → read` 写成**一个脚本**，
+在**同一次**调用里跑完。现成脚本：
+
+```bash
+bash <skill>/scripts/run-sandbox.sh --check                     # 只验连通性与登录态，不发送
+bash <skill>/scripts/run-sandbox.sh --text-file "C:/path/prompt.md" \
+     [--file "C:/path/a.md"] [--out "C:/path/out"] [--timeout 300]
+```
+
+反证：**用户自己在桌面点开的浏览器能常驻**（不受沙箱约束）。
+所以看到"浏览器起不来"先分清进程是谁起的，不要据此判定 skill 坏了。
+
+### 9.2｜`PROFILE_IN_USE_NO_CDP` 是设计出口，不是故障
+
+- 触发：绑定的 profile 被一个**不带 `--remote-debugging-port`** 的浏览器占着（通常是用户自己开的窗口）。
+- 原因（Chrome 硬限制）：**CDP 无法附加到已运行的 Chrome**；同一 user-data-dir 同时只能有一个可调试实例。
+- 处置：这是 **ask user** 出口 —— **不要**杀用户浏览器、**不要**静默换 profile。
+  请用户关掉那个窗口，或让用户自己带参启动：
+  `chrome.exe --remote-debugging-port=9444 --user-data-dir="<profile 目录>" --profile-directory=Default`
+- 判断占用者是谁：看主进程命令行里有没有 `--remote-debugging-port`；没有 → 是用户的日常窗口。
+  （Windows：`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"` 看 `CommandLine`。）
+
+### 9.3｜登录判定已加就绪窗口
+
+`isLoggedIn` 的判据是"composer 是否存在"。新标签页 / 刚导航完时 composer 还没渲染，
+`status` 会**误报** `loggedIn: false`（用户其实是登录着的）——这是最容易被误读成"未登录"的假警报。
+
+现在 `status` 与 `doctor` 会在一个窗口内轮询，而不是一锤定音：
+- 默认窗口 6000ms，可用 `CHATGPT_LOGIN_WAIT_MS` 调整。
+- `isLoggedIn(page)` 不传第二个参数时仍是"只探一次"，既有调用点的延迟不变。
+- URL 已经落到 `auth.openai.com` / `/auth/login` 时立刻下结论，不把窗口等满。
+- 交叉验证：`init` 探测里的 `chatgptTrace: true`（指向 `<profile>/IndexedDB/https_chatgpt.com_0.indexeddb.blob`）
+  是更可靠的登录证据；`cookiesLocked: true`（Chrome 127+ app-bound 加密）时 cookie 检查不可用，以 trace 为准。
+
+### 9.4｜输出路径必须是盘符绝对路径
+
+在 Git Bash 里把 `/c/Users/x` 交给 Windows 版 node，它会被当成"当前盘符的相对路径"，
+`path.resolve` 得到 `C:\c\Users\x` —— 产物**静默**写到错误位置，
+连 `read --md` 返回的 `savedMarkdown` 都是那个坏路径，调用方毫无察觉。
+
+现在：
+- **自动纠正**：`CHATGPT_OUT_DIR` 以及 `--text-file` / `--file` / `--out` 传入的 `/c/...`
+  会在启动时纠正为 `C:/...`，并在 `stderr` 打印一行提示。
+- **非法即拒绝**：Windows 上输出目录若既不是盘符绝对路径、也无法被纠正
+  （如 `/tmp/out`、UNC、相对路径），落盘前直接报 `PATH_NOT_DRIVE_ABSOLUTE` 并给出正确写法，
+  不再静默写到 `<当前盘符>\tmp\...`。
+- 只转换 `/单字母/` 这种确定是 MSYS 盘符的形式，不碰 `/usr/share` 这类真正的根路径。
+
+### 9.5｜已知限制
+
+- 子进程被回收**无法在 skill 内解决**（属宿主的进程管理策略），只能用 9.1 的"单次调用"形态绕开。
+- 9.3 的就绪窗口是折中：误报未登录消除的同时，**真未登录**时 `status` / `doctor` 会多等约 `CHATGPT_LOGIN_WAIT_MS`。
+- 9.4 的自动纠正只覆盖 MSYS 盘符形式；`/tmp/...` 这类 MSYS 根路径按"非法"处理（显式报错优于静默错位）。
+
