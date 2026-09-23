@@ -1,5 +1,29 @@
 # ChatGPT 页面结构参考
 
+> ## ⚠️ 2026-09-23 重大改版记录（务必先读）
+>
+> ChatGPT 前端**整体换了 DOM 与属性命名**，旧选择器大面积失效（实测匹配数全为 0）：
+>
+> | 元素 | 旧（失效） | 新（当前有效） |
+> |---|---|---|
+> | 输入框 | `#prompt-textarea`、`textarea[name=prompt-textarea]` | `div.ProseMirror[role="textbox"]` |
+> | 发送 | `button[data-testid="send-button"]` | `button[aria-label="Send"]`、`button[type=submit]` |
+> | 停止 | `button[data-testid="stop-button"]` | `button[aria-label="Stop"]` |
+> | 轮次容器 | `article[data-testid^="conversation-turn-"]` | `[data-turn-key]` |
+> | 助手正文 | `[data-message-author-role="assistant"]` | `div[class*="MarkdownRoot-"]` |
+> | 用户正文 | `[data-message-author-role="user"]` | `div.whitespace-pre-wrap` |
+> | 通用属性名 | `data-testid` | **`data-test-id`**（注意连字符！） |
+> | 文件输入 | — | 页面有 3 个：`image/*,video/*` / `image/*` / 空（**通用那个 accept 为空**） |
+>
+> **新增的会话临时 URL 形态**：`/c/local-chatgpt%3A<uuid>`（除已有的 `/c/WEB:<uuid>` 外）。
+>
+> **附件重名会被自动改名为 `name(1).md`** —— 精确文件名匹配必然失败，必须按 basename 主干匹配。
+>
+> **composer 会跨运行累积附件**，且发送时一起带出；未提交的草稿附件会污染下一个请求。
+>
+> 教训：**只绑语义属性、不绑标签名，并且每个元素都要有回退链**；改版后用 `probe` 实测再改选择器，
+> 不要凭旧文档假设。
+
 本文件是**唯一允许写选择器的地方**。`SKILL.md` 和业务脚本只调用 `scripts/chatgpt.mjs`，不得内联选择器。
 ChatGPT 前端会漂移；选择器失效时只改本文件 + `scripts/chatgpt.mjs` 的 `SELECTORS`/`js` 对象。
 

@@ -125,36 +125,81 @@ export async function getPage(browser, { create = true } = {}) {
   return page;
 }
 
+// 选择器必须"版本无关"：ChatGPT 前端会改结构。
+// 2026-09-22 实测：新 UI 里 #prompt-textarea / textarea[name=prompt-textarea] /
+// [data-testid=send-button] **全部消失**（匹配 0 个），输入框变为 div.ProseMirror[role=textbox]，
+// 发送按钮变成 button[type=submit][aria-label="Send"]（无 testid）。
+// 因此每个元素都用"语义属性优先 + 旧版兜底"的回退链。
 export const SELECTORS = {
-  composer: '#prompt-textarea',
-  composerFallback: "textarea[name='prompt-textarea']",
-  send: "button[data-testid='send-button']",
-  stop: "button[data-testid='stop-button']",
+  composer: [
+    '#prompt-textarea',                                  // 旧版
+    "textarea[name='prompt-textarea']",
+    'div.ProseMirror[role="textbox"]',                   // 新版
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"]',
+  ].join(', '),
+  send: [
+    "button[data-testid='send-button']",                 // 旧版
+    "button[aria-label='Send']",                         // 新版（英文）
+    "button[aria-label='发送']",
+    "button[aria-label='发送提示']",
+    "form button[type='submit']",
+  ].join(', '),
+  stop: [
+    "button[data-testid='stop-button']",
+    "button[aria-label='Stop']",
+    "button[aria-label='停止']",
+    "button[aria-label='停止回答']",
+  ].join(', '),
   voice: "button[aria-label='启动语音功能'], button[aria-label='Start voice mode']",
   turn: "[data-testid^='conversation-turn-']",
   user: "[data-message-author-role='user']",
   assistant: "[data-message-author-role='assistant']",
-  copyBtn: "button[data-testid='copy-turn-action-button']",
-  login: "button[data-testid='login-button'], a[href*='auth/login']",
-  newChat: "a[data-testid='create-new-chat-button']",
+  copyBtn: "button[data-testid='copy-turn-action-button'], button[aria-label='Copy']",
+  login: "button[data-testid='login-button'], a[href*='auth/login'], a[href*='/auth/login']",
+  newChat: "a[data-testid='create-new-chat-button'], a[aria-label='New chat'], a[aria-label='新聊天']",
 };
 
 export async function isLoggedIn(page) {
-  if (await page.locator(SELECTORS.composer).count()) return true;
-  const url = page.url();
-  if (/auth\.openai\.com|\/auth\/login/.test(url)) return false;
+  // 判据：能拿到 composer（说明已进入可用界面）。不能只看 URL —— 新版首页未登录也会停在 /。
+  if (await page.locator(SELECTORS.composer).first().count()) return true;
+  if (/auth\.openai\.com|\/auth\/login/.test(page.url())) return false;
   return false;
 }
 
 // 单次采样：所有判定都绑定在"本次新增的 assistant 消息"上，不做全页面查询。
 //
-// 为什么用 assistant 消息数而不是 conversation-turn 容器数做基线：
-// 实测一个"user+assistant"对话会产出 2 个 conversation-turn 容器，
-// 且 user 容器先出现——用容器数当基线容易被 user 轮次触发，
-// 语义上也不清晰（容器口径可能随前端漂移）。assistant 消息数是无歧义指标。
+// 为什么用 assistant 正文数而不是轮次容器数做基线：
+// 实测一个"user+assistant"对话会产出 2 个轮次容器，且 user 容器先出现——
+// 用容器数当基线会被 user 轮次触发。assistant 正文数是无歧义指标。
+//
+// ⚠️ 2026-09-22 实测漂移：新版 UI 里 data-message-author-role / conversation-turn-* /
+// article 全部为 0。新锚点是：
+//   轮次容器  [data-turn-key]
+//   助手正文  div[class*="MarkdownRoot-"]（用户消息是 div.whitespace-pre-wrap）
+//   发送/停止  button[aria-label='Send'|'Stop']（无 data-testid）
+// 因此下面一律走"新版优先 + 旧版兜底"的回退链。
+const ASSISTANT_BODY_SEL = [
+  "[data-message-author-role='assistant']",           // 旧版
+  'div[class*="MarkdownRoot-"]',                      // 新版
+  '.markdown', '.prose',
+].join(', ');
+const TURN_SEL = "[data-turn-key], [data-testid^='conversation-turn-']";
+const STOP_SEL_JS = [
+  "button[data-testid='stop-button']",
+  "button[aria-label='Stop']",
+  "button[aria-label='停止']",
+  "button[aria-label='停止回答']",
+].join(', ');
+
 const PROBE = (baselineAssistant) => {
-  const assts = [...document.querySelectorAll("[data-message-author-role='assistant']")];
-  const stop = document.querySelector("button[data-testid='stop-button']");
+  // 只统计"助手正文"，不统计轮次容器（后者含用户消息，会误触发）
+  const bodies = [...document.querySelectorAll('div[class*="MarkdownRoot-"]')];
+  const legacy = [...document.querySelectorAll("[data-message-author-role='assistant']")];
+  const assts = bodies.length ? bodies : legacy;
+  const stop = document.querySelector("button[data-testid='stop-button']")
+    || document.querySelector("button[aria-label='Stop']")
+    || document.querySelector("button[aria-label='停止']");
   const base = baselineAssistant || 0;
   const isNew = assts.length > base;
   const target = isNew ? assts[assts.length - 1] : null;
@@ -280,7 +325,9 @@ export async function waitForCompletion(page, {
 //   最终:   /c/6aaf5c42-fff8-83e8-b6b8-2e4058b9ccb1
 // 项目内: /g/g-p-xxxx/c/<id>
 // 只认 UUID 作为稳定主键；临时 id 单独返回，且不当作漂移依据。
-const RE_TMP = /\/c\/(WEB:[0-9a-f-]+)/;
+// 实测到的临时会话 id 前缀：WEB: 与 local-chatgpt:（后者 URL 编码为 %3A）。
+// 它们都会被替换成最终 UUID，所以只用于诊断，不作为稳定主键或漂移依据。
+const RE_TMP = /\/c\/((?:WEB|local-chatgpt)[:%][0-9a-f-]+)/i;
 const RE_UUID = /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
 export function convIds(url) {

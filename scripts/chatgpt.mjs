@@ -76,10 +76,19 @@ function emit(obj, args) {
 }
 
 // ---------- DOM 操作 ----------
+// 注意：这些函数在**页面上下文**里执行，不能引用外部变量，所以选择器在函数内自带回退链。
+// 与 lib.mjs 的 SELECTORS 保持一致：语义属性优先 + 旧版兜底。
+const COMPOSER_SEL = "div.ProseMirror[role='textbox'], [contenteditable='true'][role='textbox'], #prompt-textarea, textarea[name='prompt-textarea'], [contenteditable='true']";
+const SEND_SEL = "button[data-testid='send-button'], button[aria-label='Send'], button[aria-label='发送'], button[aria-label='发送提示'], form button[type='submit']";
+const STOP_SEL = "button[data-testid='stop-button'], button[aria-label='Stop'], button[aria-label='停止'], button[aria-label='停止回答']";
+
 const js = {
   insertText: (text) => {
-    const el = document.querySelector('#prompt-textarea')
-      || document.querySelector("textarea[name='prompt-textarea']");
+    const el = document.querySelector("div.ProseMirror[role='textbox']")
+      || document.querySelector("[contenteditable='true'][role='textbox']")
+      || document.querySelector('#prompt-textarea')
+      || document.querySelector("textarea[name='prompt-textarea']")
+      || document.querySelector("[contenteditable='true']");
     if (!el) return { ok: false, error: 'composer-not-found' };
     el.focus();
     const dt = new DataTransfer();
@@ -88,19 +97,30 @@ const js = {
     return { ok: true, len: (el.innerText || el.value || '').length };
   },
   composerText: () => {
-    const el = document.querySelector('#prompt-textarea')
-      || document.querySelector("textarea[name='prompt-textarea']");
+    const el = document.querySelector("div.ProseMirror[role='textbox']")
+      || document.querySelector("[contenteditable='true'][role='textbox']")
+      || document.querySelector('#prompt-textarea')
+      || document.querySelector("textarea[name='prompt-textarea']")
+      || document.querySelector("[contenteditable='true']");
     return el ? (el.innerText || el.value || '') : null;
   },
   sendInfo: () => ({
-    send: !!document.querySelector("button[data-testid='send-button']"),
-    stop: !!document.querySelector("button[data-testid='stop-button']"),
+    send: !!document.querySelector("button[data-testid='send-button']")
+      || !!document.querySelector("button[aria-label='Send']")
+      || !!document.querySelector("button[aria-label='发送']")
+      || !!document.querySelector("form button[type='submit']"),
+    stop: !!document.querySelector("button[data-testid='stop-button']")
+      || !!document.querySelector("button[aria-label='Stop']")
+      || !!document.querySelector("button[aria-label='停止']"),
   }),
   lastAssistant: () => {
-    const turns = [...document.querySelectorAll("[data-testid^='conversation-turn-']")];
-    const last = turns[turns.length - 1];
-    const asst = last?.querySelector("[data-message-author-role='assistant']");
+    // 新版优先：助手正文是 MarkdownRoot；轮次容器是 [data-turn-key]
+    // 旧版兜底：conversation-turn + data-message-author-role
+    const mdBodies = [...document.querySelectorAll('div[class*="MarkdownRoot-"]')];
+    const legacy = [...document.querySelectorAll("[data-message-author-role='assistant']")];
+    const asst = mdBodies.length ? mdBodies[mdBodies.length - 1] : legacy[legacy.length - 1];
     if (!asst) return null;
+    const turns = document.querySelectorAll("[data-turn-key], [data-testid^='conversation-turn-']");
     const imgs = [...asst.querySelectorAll('img')]
       .map((i) => ({ src: i.currentSrc || i.src, alt: i.alt || '', w: i.naturalWidth, h: i.naturalHeight }))
       .filter((i) => i.src && !/avatar|profile|emoji|icon/i.test(i.src));
@@ -109,7 +129,10 @@ const js = {
       const lang = code?.className?.match(/language-([\w+-]+)/)?.[1] || '';
       return { lang, text: (code || p).innerText };
     });
-    return { text: asst.innerText || '', imgs, codes, turnIndex: turns.length };
+    return {
+      text: asst.innerText || '', imgs, codes,
+      turnIndex: turns.length, assistantIndex: (mdBodies.length || legacy.length),
+    };
   },
 };
 
@@ -271,8 +294,10 @@ async function cmdProject(args) {
     if (await openBtn.count()) { await openBtn.click({ force: true }); }
     else { await row.click(); }
     await sleep(3500);
-    const ph = await page.locator('#prompt-textarea').getAttribute('aria-label').catch(() => null);
-    return { ok: true, url: page.url(), placeholder: ph, ...convIds(page.url()) };
+    // 项目上下文的可靠判据是 URL 里的 projectId；aria-label 只作辅助信号（新版 UI 可能是 "Ask ChatGPT"）
+    const ph = await page.locator(SELECTORS.composer).first().getAttribute('aria-label').catch(() => null);
+    const ids = convIds(page.url());
+    return { ok: true, url: page.url(), placeholder: ph, inProject: !!ids.projectId, ...ids };
   });
 }
 
@@ -328,40 +353,74 @@ async function cmdSend(args) {
     if (files.length) {
       const abs = files.map((f) => path.resolve(f));
       for (const f of abs) if (!fs.existsSync(f)) return { ok: false, error: 'file-not-found', file: f };
-      const input = page.locator("input[type='file']").first();
-      if (!(await input.count())) return { ok: false, error: 'file-input-not-found' };
+      // 文件输入有 3 个（图片 / 媒体 / 通用），绝不能盲取 .first()：
+      // 新会话里第一个可能是 accept="image/*"，塞文件进去会被静默忽略（2026-09-23 实测）。
+      // 判据：优先 accept 含非图片类型的，退而取任意文件输入，最后才用第一个。
+      const pick = await page.evaluate(() => {
+        const inputs = [...document.querySelectorAll("input[type='file']")];
+        const info = inputs.map((el, i) => ({ i, accept: (el.getAttribute('accept') || ''), multiple: !!el.multiple }));
+        const nonImage = info.find((x) => x.accept && !/^image\//.test(x.accept));
+        const noAccept = info.find((x) => !x.accept);
+        return { count: info.length, chosen: (nonImage || noAccept || info[0] || {}).i ?? null, info };
+      });
+      if (pick.chosen === null) return { ok: false, error: 'file-input-not-found', probe: pick };
+      const input = page.locator("input[type='file']").nth(pick.chosen);
       await input.setInputFiles(abs);
+      // 先记录 composer 里已有的附件：ChatGPT 会跨运行累积，且重名会自动改名为 name(1).md。
+      // 因此"精确文件名匹配"会失败——必须按 basename 主干匹配（见下）。
+      const preexisting = await page.evaluate(() => {
+        const txt = document.querySelector('form')?.innerText || '';
+        return (txt.match(/[^\s|]+\.(?:md|txt|pdf|docx?|png|jpe?g|csv|json|zip|xlsx?)/gi) || []);
+      });
+      // composer 会跨运行累积附件，且发送时会一起带出——会让上层拿到"不是它要求"的请求。
+      //
+      // 但要区分两种"已存在"：
+      //   a) 真脏状态：上一次运行/别的任务留下的附件（危险，必须拦）
+      //   b) 本次自己的残留：上一次 send 未确认提交、文本与附件仍在 composer（安全，重试即可）
+      // 判据：tabs.json 里是否记录了本会话上一次未完成的发送（pendingText 非空）。
+      const prevTabs = readTabs();
+      const retryOwnDraft = typeof prevTabs.pendingText === 'string' && prevTabs.pendingText.length > 0;
+      if (preexisting.length && args['allow-preexisting'] !== true && !retryOwnDraft) {
+        return {
+          ok: false, error: 'composer-has-preexisting-attachments', preexisting,
+          hint: '当前 composer 已挂有附件，本次发送会把它们一起带出。'
+            + '处理：先 new 开新会话，或重载页面再试；确认无碍可加 --allow-preexisting。',
+        };
+      }
       uploaded = abs;
       // 等附件 chip 真正渲染完成再发送，否则会发出空附件消息。
-      // 检测要宽：只看 form/body 的文本在 UI 忙时会超时（e2e 里实测），
-      // 所以同时认"文件已被 input 接收"和"chip 文本出现"两类证据。
-      const names = abs.map((f) => path.basename(f));
+      // 关键：用 basename 主干匹配，兼容 ChatGPT 的 name(1).md 自动重命名。
+      // 同时注意新版会先显示 "Uploading"，必须等它消失。
+      const stems = abs.map((f) => {
+        const base = path.basename(f);
+        const dot = base.lastIndexOf('.');
+        return (dot > 0 ? base.slice(0, dot) : base).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      });
       let chipReady = false;
       let lastProbe = null;
       for (let i = 0; i < 60; i++) {            // 最长 30s
-        lastProbe = await page.evaluate((ns) => {
-          const form = document.querySelector('form');
-          const formTxt = form ? (form.innerText || '') : '';
+        lastProbe = await page.evaluate((ss) => {
+          const formTxt = document.querySelector('form')?.innerText || '';
           const bodyTxt = document.body.innerText || '';
-          const inputs = [...document.querySelectorAll("input[type='file']")]
-            .map((el) => (el.files ? el.files.length : 0));
+          const hit = (t) => ss.filter((s) => new RegExp(s + '(?:\\(\\d+\\))?\\.[a-z0-9]+', 'i').test(t)).length;
           return {
-            inForm: ns.filter((n) => formTxt.includes(n)).length,
-            inBody: ns.filter((n) => bodyTxt.includes(n)).length,
-            inputFiles: inputs.reduce((a, b) => a + b, 0),
+            matchedInForm: hit(formTxt),
+            matchedInBody: hit(bodyTxt),
+            uploading: /Uploading|上传中/.test(formTxt),
           };
-        }, names);
-        if (lastProbe.inForm >= names.length || lastProbe.inBody >= names.length) { chipReady = true; break; }
+        }, stems);
+        const seen = lastProbe.matchedInForm >= stems.length || lastProbe.matchedInBody >= stems.length;
+        if (seen && !lastProbe.uploading) { chipReady = true; break; }
         await sleep(500);
       }
       if (!chipReady) {
         return {
           ok: false, error: 'attachment-not-confirmed', uploadedCount: 0,
-          expected: names, probe: lastProbe,
-          hint: '附件已提交给页面但未确认渲染（可能是上传过慢或 UI 改版）。本次未发送消息，避免发出空附件。',
+          expected: stems, probe: { ...lastProbe, inputChoice: pick, preexisting },
+          hint: '附件未能确认就绪（仍在 Uploading 或 UI 改版）。本次未发送消息，避免发出空附件。',
         };
       }
-      await sleep(800);
+      await sleep(600);
     }
 
     if (text) {
@@ -438,12 +497,15 @@ async function cmdSend(args) {
     if (ids.conversationId && !ids.temporary) t.conversationId = ids.conversationId;
     else delete t.conversationId;   // 拿不到稳定 id 就不要留一个会误报漂移的旧值
     t.sentAt = new Date().toISOString();
+    // 记录未提交的草稿：既让上层看到 pendingText，也让下次 send 能识别"这是自己的残留"而不误拦
+    const pendingText = submitted ? '' : (await page.evaluate(js.composerText) || '');
+    t.pendingText = pendingText;
     writeTabs(t);
     const result = {
       ok: submitted, submitted, attempts,
       uploaded, uploadedCount: uploaded.length,
       baselineAssistant: before,
-      pendingText: submitted ? '' : await page.evaluate(js.composerText),
+      pendingText,
       url, ...ids, turnsBefore: before,
       requestId, ...budget,
     };
