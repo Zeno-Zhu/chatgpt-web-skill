@@ -169,6 +169,11 @@ node scripts/chatgpt.mjs new
 node scripts/chatgpt.mjs ask --text "问题" --file /abs/path.md --json
 ```
 
+## 交给其他 AI 使用
+
+**先让它读 [`HANDOVER.md`](HANDOVER.md)** —— 一页纸说清：只用 CLI、不要碰浏览器、
+两道 Gate（该不该问 / 用什么思维）、必须遵守的判据、禁止清单、诊断顺序。
+
 ## 写入 agent 的"思考核心"
 
 各 agent 的 skill 目录只管**能被发现**；要让它成为**日常习惯**，还需把下面这段写进宿主的
