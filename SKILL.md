@@ -58,6 +58,7 @@ description: 用确定性命令操控网页版 ChatGPT（复用已登录会话�
 
 **Invariants**
 - 不导出、不复制、不保存 cookie / token / localStorage / storage_state。
+  `/api/auth/session` 的 `accessToken` 只在内存里用于 `/backend-api/*`（生图取图），**不打印、不落盘、不进返回值**。
 - 不代替用户登录、过 MFA/CAPTCHA、点 OAuth 同意、绕过付费墙与限额。
 - 不静默降级模型：要 Pro 却拿不到，就如实报告可见选项，让用户决定。
 - 不往 ChatGPT 发送凭证类内容（cookie / API key / 私钥 / 身份证号），即使用户原始请求里带。
@@ -80,14 +81,17 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 
 | 动作 | 命令 | 幂等? |
 |---|---|---|
-| Connect | `launch` | ✅ 已在运行则复用 |
-| Preflight | `status` | ✅ 只读 |
+| Init（每台机器一次） | `init [--browser X --user-data-dir Y]` / `config` | ✅ 只读；`init` 不带参数只探测，带参数才写且已有绑定需 `--force` |
+| Connect | `launch` | ✅ 已在运行则复用（并验证 profile 是否匹配） |
+| Preflight | `status` / `doctor` | ✅ 只读 |
 | Context | `goto <url>` / `project <名>` | ✅ 只读定位 |
 | Context | `new` | ❌ 每次都开新会话 |
 | Compose | `send --text-file ... [--file ...]` | ❌ **重跑 = 再发一条消息** |
 | Wait | `wait [--timeout 秒]` | ✅ 只观察（会消费基线） |
 | Read | `read [--md] [--save]` | ✅ 只读；`--save` 会再落一份文件 |
 | Inspect | `tabs` / `model [名]` | ✅ 只读（`model` 带参会切换） |
+| Image | `image start` | ❌ **重跑 = 再开一个会话再生一张**（要防重就用 `--request-id` 之外的 jobId 记账；先 `image list` 看清在途） |
+| Image | `image list` / `wait` / `download` | ✅ 只读；`download` 会再落一份文件 |
 | Route | `route --impact N --uncertainty N --gap N` | ✅ 纯计算，决定该不该调用 |
 
 - `send` 只有在**明确确认上次未提交**（`submitted: false`）时才可安全重跑。
@@ -99,12 +103,24 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 
 ## 3｜执行流程（agent 照此调用）
 
+### Step 0｜机器级绑定（每台机器一次，不是每次调用）
+```bash
+node <skill>/scripts/chatgpt.mjs config    # 只读：现在会用哪个浏览器 / 哪个 profile，各自来自哪里
+```
+- 没绑定（`configExists: false`，或 `effective.userDataDir` 为空）→ 先 `init` 探测，再显式绑定：
+  `init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>" [--profile-directory Default]`。
+- **不要**为了省事让用户"再登录一次"：同一账号在多处重复登录容易触发风控；
+  优先复用用户**已有**的登录 profile（写进 `~/.chatgpt-web/config.json`，机器专属、不进 git）。
+- 绑定是显式的：已有绑定要改必须加 `--force`；skill 不会自动改，也不会偷偷换 profile。
+
 ### Step 1｜Preflight
 ```bash
 node <skill>/scripts/chatgpt.mjs launch
 node <skill>/scripts/chatgpt.mjs status      # 必须看到 loggedIn: true
 ```
 `loggedIn: false` → **停下**，让用户在那个被打开的 Chrome 窗口里登录，然后重试。不要自己想办法登录。
+`profileVerified: false` → 连上的是**别的** profile（`launch` 会拒止）；`null` → 本平台无法验证，
+可继续，但必须如实转述"没能证明用的是绑定 profile"。
 
 ### Step 1.5｜先算路由 Gate（不要凭感觉决定要不要问）
 ```bash
@@ -172,6 +188,53 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 - 长回答可能被 GPT 侧截断（出现"继续生成"）。此时**必须**标注"可能不完整"，并可 `send --text "继续"` 续写。
 - 深度研究报告正文在 iframe 内，`read` 取不到时如实说明，不要假装拿到了。
 
+### Step 5.5｜生图任务（一张图 = 一个 GPT 会话）
+
+```bash
+# 一个任务 = 一个新会话（"窗口"）：发完提示词、等 URL 定型就返回，**不等生成**
+node <skill>/scripts/chatgpt.mjs image start --text "画一张…" --json
+# → { jobId, conversationId, url, urlStable: true, inFlight, max }
+
+node <skill>/scripts/chatgpt.mjs image list --json          # 每个任务：ready / generating / text_only / failed
+node <skill>/scripts/chatgpt.mjs image wait --job <id>      # 等某张出图
+node <skill>/scripts/chatgpt.mjs image download --job <id> [--out <目录>]
+node <skill>/scripts/chatgpt.mjs image download --all       # 收所有已出图的
+node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：start → wait → download
+```
+
+**取图有三条路，默认必须是 API（`--mode api`）**：
+
+| mode | 怎么拿 | 代价 | 什么时候用 |
+|---|---|---|---|
+| `api`（默认） | 会话 JSON 的 `image_asset_pointer` → `/files/<id>/download` → `download_url` | 不碰页面、不依赖前台；~2s | **默认，无人值守** |
+| `dom` | 前台渲染出的 `<img src=…estuary/content?id=…>` → 只用 cookie 取字节 | **要抢前台**（`--allow-ui`），冷加载要轮询最多 ~25s，实测整次 50s | API 失效 / 要核对"浏览器自己加载的字节" |
+| `native` | 点原生"下载"按钮 + 接 download 事件 | 同上 + 依赖按钮存在 | 当前 UI **没有**该按钮 → 会如实返回 `NATIVE_ACTION_UNAVAILABLE` |
+
+- 三条路的字节实测**完全一致**（同 SHA-256），所以 `--mode dom` 是可信的对照/兜底，
+  但**不要**把它当主链路：它会抢用户焦点、滚动、切会话。
+- `--mode auto` = 先 api；只有一张都没拿到**且**显式加了 `--allow-ui` 才退到 dom。
+  **绝不静默走 native 点击。**
+- UI 路径要独占窗口：会抢全局锁（占用时返回 `status: busy`）。
+
+规则（照此执行，不要自己发明流程）：
+
+- **可以连续开**：`start` 返回后立刻可以 `start` 下一个新会话，生成在服务端并行；
+  默认**同时在途上限 10**（`--max` / `CHATGPT_IMAGE_MAX` / config `imageMaxInFlight` 可调），
+  超了返回 `IMAGE_LIMIT_REACHED`。**"在途"= 还没被观测到完成的任务**：跑一次
+  `image list` / `wait` / `download` 观测到出图后名额**立即**释放（不必等下载完）——
+  所以只 start 不收图会把名额占满。
+- `urlStable: false`（极少数情况下 30s 内仍是临时 `WEB:` id）→ 如实转述，别把它当稳定入口。
+- 收图**不需要**点回那个会话：`image download` 按会话 id 读会话 JSON 并下载。
+  这是**故意**不用 DOM 的：实测后台标签页里那些 `<img>` 根本不存在（只有空的
+  `image-gen-overlay-*` 壳），而且当前 UI **没有"图片下载"按钮**（overlay 只有 编辑图片/分享此图片）。
+  前台 DOM 路径仍有（`--mode dom --allow-ui`），但慢且会抢用户焦点，只做兜底。
+- 落盘：`<CHATGPT_OUT_DIR>/<jobId>/<序号>-<服务端文件名>.<ext>` + `images.json` 元数据
+  （fileId / 字节数 / 宽高 / 校验结果）。**一张图一个文件**，多张自动编号。
+- 状态语义：`ready`=有图可下；`generating`=还在生成；`text_only`=模型只回了文字（没出图，
+  把 `lastText` 原样给用户看）；`failed`=报错/会话不可访问。
+- 凭证：`/backend-api/*` 需要应用内 access token（`/api/auth/session`）。
+  **只在内存里用于本次请求，绝不打印、绝不落盘、绝不返回值里带上**——这是 Protected Rule。
+
 ### Step 6｜异常路由（只走已定义出口）
 
 `wait` 的 `status` 与出口一一对应：
@@ -179,7 +242,21 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 | status / 现象 | 出口 | 动作 |
 |---|---|---|
 | `success` | commit | 进入 Step 7 |
+| `IMAGE_LIMIT_REACHED` | wait | 在途已达上限 → 先 `image list`/`download` 观测掉已出图的（名额自动释放），再 start |
+| `IMAGE_JOB_NOT_FOUND` | repair | `image list` 确认 jobId / conversationId |
+| `FOREGROUND_REQUIRED` | ask user | `--mode dom/native` 需要抢前台 → 加 `--allow-ui`，或改用默认 `--mode api` |
+| `NATIVE_ACTION_UNAVAILABLE` | repair | 当前 UI 没有图片下载按钮 → 换 `--mode api`（或 `dom`） |
+| `IMAGE_ASSET_NOT_FOUND` | repair | 会话 JSON / 前台 DOM 里都没有该 fileId 的图 → 先 `image wait` 确认是否出图 |
+| `DOWNLOAD_EVENT_TIMEOUT` | repair | native 点击后没等到 download 事件（多半是命中/改版）；用 api/dom 兜底并记录 |
+| 生图 `text_only` | report | 模型没出图只回了文字 → 原文给用户，别假装有图 |
+| `attachment-not-confirmed` | repair | 附件 chip 没确认渲染 → 本次未发送（**不要**当成功）；看 `probe`/`attachInput` |
 | `NO_CDP` | repair | 跑 `launch`，失败则报告 |
+| `CHROME_NOT_FOUND` | repair | 绑定的浏览器路径不存在或本机没有浏览器 → `init --browser <绝对路径>` |
+| `SPAWN_FAILED` / `CDP_TIMEOUT` | repair | 浏览器没起来 / 起来了但没开调试端口；先手工执行 hint 里的命令看报错 |
+| `PROFILE_MISMATCH` | **stop** | CDP 端口上跑的不是绑定 profile → **不要**把它的会话当结果；按 hint 修（换实例/改绑定） |
+| `PROFILE_IN_USE_NO_CDP` | ask user | 绑定的 profile 正被没有调试端口的浏览器占用；请用户用 hint 里的参数重启，**不许杀用户浏览器、不许换 profile** |
+| `PROFILE_IN_USE_OTHER_PORT` | ask user | 同一 profile 已被另一个可调试实例占用（hint 里有端口）；要么复用它，要么先关掉 |
+| `CONFIG_ERROR` | ask user | `~/.chatgpt-web/config.json` 坏了或要改绑定 → 修好或加 `--force`，不要绕过 |
 | `NOT_LOGGED_IN` / `auth_required` | ask user | 让用户登录，**不代劳** |
 | `no_response_started` | repair | 本次请求根本没开始生成；重新 `send` |
 | `timeout` | continue/ask | 已开始但没写完；再 `wait` 一轮，累计别超用户可接受上限 |
@@ -217,6 +294,9 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 - 发送消息、等待、读取：A2（自主执行后汇报）。
 - 上传用户文件：A1（默认执行；文件含敏感信息时先确认）。
 - 触发**分享/公开链接**、删除会话/项目、清空 Memory：A0，必须先取得明确同意。
+- **绝不杀用户的浏览器进程**、绝不静默换 profile、绝不复制/迁移 cookie：
+  profile 被占用时如实报 `PROFILE_IN_USE_*` 并请用户决定（复用还是重启）。
+- 绑定的 profile 往往是用户的日常浏览器：动它之前先说清"会在那个窗口里开会话/切标签页"。
 
 ## 6｜复盘与迭代
 
@@ -231,11 +311,14 @@ node <skill>/scripts/chatgpt.mjs read --save            # 额外下载图片
 
 | 项 | 值 |
 |---|---|
-| 脚本位置 | `<skill>/scripts/chatgpt.mjs`（其它环境可安装到 `~/.dsh/skills/chatgpt-web/`） |
-| 依赖 | Node ≥ 20 + `playwright-core`（`npm install` 于 skill 目录，离线可用） |
-| 浏览器 | 自动化专用 Chrome profile：`~/.chatgpt-web/profile` |
-| CDP | `http://127.0.0.1:9444`（`CHATGPT_CDP_PORT` 可改） |
-| 为什么独立 profile | 运行中的 Chrome 无法事后开启 CDP；Chrome 136+ 禁止默认 profile 开调试端口。独立实例同时避免与其它 debugger 控制方抢占 |
+| 脚本位置 | `<skill>/scripts/chatgpt.mjs`（安装到 `$DSH_HOME/skills/chatgpt-web/`，`DSH_HOME` 未设时为 `~/.dsh/skills/`） |
+| 依赖 | Node ≥ 20 + `playwright-core`（在 skill 目录 `npm install`，离线可用） |
+| **机器级绑定** | `~/.chatgpt-web/config.json`：`browserPath` / `userDataDir` / `profileDirectory` / `cdpPort` / `agent`（机器专属，**不进 git**） |
+| 绑定优先级 | 环境变量 > `config.json` > `<skill>/.env.agent`（宿主级实例名）> 默认值 |
+| 安装 | `node scripts/install.mjs [--dry-run] [--only dsh] [--root <skills 目录>]`（Windows 可用）；bash 版 `scripts/install.sh`（跟随 `DSH_HOME`） |
+| 浏览器 | 用 `init` 绑定的那个（Windows 上会探测 Chrome/Beta/Dev/Canary/Chromium/Edge/Brave） |
+| CDP | 默认 `http://127.0.0.1:9444`（`cdpPort` / `CHATGPT_CDP_PORT` 可改） |
+| 为什么必须显式绑定 | 运行中的 Chrome 无法事后开启 CDP；同一 user-data-dir 同时只能有一个可调试实例；Chrome 136+ 禁止默认 user-data-dir 开调试端口；重复登录有风控风险 |
 
 首次使用只需登录一次，之后所有 agent 复用同一实例。
 

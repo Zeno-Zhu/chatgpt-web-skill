@@ -126,17 +126,24 @@ ui_changed / empty_response / no_response_started / busy`。
 **会话选择必须由上层显式声明（`new`/`goto`/`project`），不能靠隐式状态**，
 否则多任务切换时会出现"答案正确但归属错误"——这与并发串线是同一类风险。
 
+### 12. "用哪个浏览器/profile"必须是机器级显式绑定，不能由 skill 猜
+本机（Windows）实测：默认自动化 profile 没登录，而用户日常 Chrome 的另一个 user-data-dir
+里**已经登录**了 GPT。让用户在默认 profile 里再登录一次，等于**同一账号重复登录，有风控风险**；
+但若不显式绑定，skill 就会一直打开"不是用户指定的那个浏览器"，而用户看到的只是"你怎么又开了个空窗口"。
+结论：**把绑定提升为机器级显式配置**（`~/.chatgpt-web/config.json`，不进仓库），
+优先级 环境变量 > config.json > 宿主级 `.env.agent` > 默认值，且**默认值里绝不含浏览器与 profile 路径**。
+
 ## 四之二、第二次改版风暴（2026-09-23）：ChatGPT 前端整体换血
 
-用户报告"调用 skill 给 GPT 发条消息"时，暴露出**一次大规模 DOM 改版**，共 4 类缺陷：
+用户报告"调用 skill 给 GPT 发条消息"时，暴露出**一次大规模 DOM 改版**，共 6 类缺陷：
 
 | # | 缺陷 | 根因 | 修复 |
 |---|---|---|---|
 | 13 | 登录态被误判为未登录 | 新版输入框不再是 `#prompt-textarea`，`isLoggedIn` 失真；实际早已登录（左下角 `laozhu/Plus`） | 登录判据改为"能否拿到 composer"，选择器加回退链 |
 | 14 | 发送/停止按钮全部匹配 0 个 | 新版无 `data-testid`，发送是 `button[aria-label="Send"]`；属性名也从 `data-testid` 变成 `data-test-id` | 发送/停止改为 aria-label 回退链 |
 | 15 | 读不到回答，`wait` 一直卡住 | 新版轮次是 `[data-turn-key]`，助手正文是 `div[class*="MarkdownRoot-"]`，旧选择器全为 0 | 读取改为新版优先 + 旧版兜底 |
-| 16 | 附件上传静默失败 | 页面有 3 个 file input，`.first()` 拿到的是 `accept="image/*"`，塞文件被忽略 | 按 accept 精确选"通用文件输入" |
-| 17 | 附件确认永远失败 | ChatGPT 对重名附件自动改名为 `name(1).md`，精确匹配必然不中 | 改为按 basename 主干 + `(\d+)` 后缀的正则匹配 |
+| 16 | 附件上传静默失败 | 页面有 3 个 file input，`.first()` 拿到的是 `accept="image/*"`，塞文件被忽略 | 收敛到 `compose.setDocumentFiles`，按 accept 精确选"通用文件输入" |
+| 17 | 附件确认永远失败 | ChatGPT 对重名附件自动改名为 `name(1).md`，精确匹配必然不中 | 用 `compose.attachmentNameRe` 按主干 + `(\d+)` 后缀匹配（与远端实现合并） |
 | 18 | 脏附件污染请求 | composer 跨运行累积附件，发送时一起带出 | 新增 `composer-has-preexisting-attachments` 拦截；用 `pendingText` 区分"自己的残留"与"真脏状态" |
 
 ### 本轮最该记住的方法论教训
@@ -145,21 +152,171 @@ ui_changed / empty_response / no_response_started / busy`。
 
 1. 先以为"上传 3/3 成功"→ 其实那些 `send` 全被**残留 wait 进程持有的锁**挡掉了，
    返回的 `busy` 被我 grep 过滤掉了，我读到的"成功"来自别的调用。
-2. 再以为"e2e 失败是偶发/污染"→ 实际是重名附件的确定性 bug。
+2. 再以为"e2e 失败是偶发/污染"→ 实际是重名附件的确定性 bug（远端已用 `attachmentNameRe` 修过，
+   我的分支重复踩了同一个坑——**说明"改过的坑"必须写进文档，否则会二次踩**）。
 3. 差点把"composer 有遗留附件"当成 e2e 的环境问题，实际它是**会影响真实用户的缺陷**。
 
 教训：
 - **被锁/被拒绝的调用不能算验证**；验证前必须确认没有残留进程占锁，并检查返回码而非只看部分字段。
 - **`grep` 过滤输出会隐藏失败原因**——关键验证要看完整 JSON。
-- **偶发失败的第一次出现就值得追根因**，不要用"再跑一次"掩盖。
+- **偶发失败的第一次出现就值得追根原因**，不要用"再跑一次"掩盖。
+- **并行开发时，双方可能独立踩到同一个坑**：合并前先读对方改动，避免"重复修复 + 语义冲突"。
 
 ## 五、仍未解决 / 未验证（诚实清单）
 
-- **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次。已用 `doctor` 把这一步显性化。
-- **Windows / Linux 未实机验证**：`resolveChrome()` 的路径表是通用做法，但**本机只有 macOS 实测**。
+### 13. 进程状态可以"尽力验证"，但不可"假装验证"
+Windows 实测：`--remote-debugging-port` 只对应主进程，但 renderer 子进程的 cmdline 里
+**同样带** `--user-data-dir`；因此判"谁占用了这个 profile"要优先取主进程（`--type=` 缺失的那个）。
+本平台拿不到进程信息时返回 `supported:false` + `profileVerified:null`：
+`doctor` 会明说"无法验证"，**不把 unknown 当 true**。
+
+## 五、Windows 实机验证（2026-09-20，首次）
+
+环境：Windows + Chrome 153（Program Files 安装，Edge 只装在 Program Files (x86)），
+Node v24.11，skills 根目录由 `DSH_HOME` 指定（**不是** `~/.dsh/skills`），
+绑定 profile 为一个"用户已登录 GPT"的日常 user-data-dir（非默认目录）。
+
+**已实机跑通**（非推理）：`doctor` / `init`（探测）/ `config` / `launch` / `status` / `new` / `send`（带附件）/
+`wait` / `read --md` / `ask` / `model` / `route` / `method`。
+附件链路验证方式：附件里写 `SECTION-TOKEN = ALPHA-7788`，GPT 的回复里**真的把它念了回来**，
+说明附件确实送达并被读取，不是"看起来发送成功"。
+
+本轮实机发现并修掉的缺陷：
+
+| # | 缺陷 | 根因（Windows 实测） | 修法 |
+|---|---|---|---|
+| 1 | `read --json` 的 `code` 变成 `[]` | 协议信封写成 `{协议字段, ...payload}`，payload 里同名的业务字段（代码块数组）**顶掉了状态码** | 信封改为 payload 在前、协议字段在后覆盖 |
+| 2 | 带附件时 `send` 白等 10s 才回退 Enter | chip 文本先出现、上传未完成时按钮是 `aria-disabled="true"`（`disabled` 属性仍为 false），坐标点击被 UI 忽略 | 上传后轮询等按钮真正可用（`attachmentReady`），不可用则跳过点击直接 Enter；按钮确认窗口 10s→6s |
+| 3 | "没装浏览器"报成 `spawn ENOENT` | `cmdLaunch` 在 `launchChrome()` **之后**才判 `!CHROME`，而 `spawn('')` 先抛异常 | 判空前置到 spawn 之前，返回 `CHROME_NOT_FOUND` + 可操作提示 |
+| 4 | Edge 探测漏判 | 候选表只查 `%PROGRAMFILES%\Microsoft\Edge`，本机 Edge **只装在 `%ProgramFiles(x86)%`** | 候选表按 Program Files / (x86) / LocalAppData × Chrome/Beta/Dev/Canary/Chromium/Edge/Brave 展开 |
+| 5 | `install.sh` 在 Windows 装错位置 | bash 脚本 + 硬编码 `$HOME/.dsh/skills`，而本机 skills 根是 `$DSH_HOME/skills` | 新增跨平台 `scripts/install.mjs`（支持 `--root/--only/--dry-run/--agent`）；`install.sh` 改为跟随 `DSH_HOME` |
+| 6 | `.env.agent` 是死配置 | `install.sh --agent` 会写它，但**没有任何代码读它**（文档承诺的实例隔离不生效） | 新增 `config.mjs` 真正读取它（宿主级实例名，优先级低于环境变量、高于 config.json 默认值） |
+| 7 | 重跑 `init` 会静默改绑定 | 无冲突检查 | 与既有绑定不同时必须 `--force`，否则 `CONFIG_ERROR` + `conflicts` 明细 |
+
+**仍未验证 / 已知限制**：
+- 图片生成落盘（`read --save`）、Deep Research（正文在 iframe 内）、`project` 项目上下文在 Windows 上未实机验证。
+- 用户日常 profile 与自动化实例**互斥**：同一个 user-data-dir 同时只能有一个可调试实例
+  （已实测：换个实例名再用同一 profile → `PROFILE_IN_USE_OTHER_PORT`，并给出确切手工启动命令）。
+- 若用户**已经**用普通方式打开了那个 profile（没有调试端口），运行中的 Chrome 无法事后开启 CDP，
+  此时返回 `PROFILE_IN_USE_NO_CDP` 并提示用户用绑定参数重启；**skill 不会去杀用户浏览器，也不会偷偷换 profile**。
+- 默认 user-data-dir（`%LOCALAPPDATA%\Google\Chrome\User Data`）即使有 ChatGPT 登录也**不可绑定**：
+  Chrome 136+ 禁止默认目录开远程调试端口。`init` 会就此给出显式警告。
+
+### 判断"这个 profile 登录过 GPT"不能只靠 Cookies 文件
+Windows 实测：Chrome 运行时**独占** `<profile>\Default\Network\Cookies`（读它报"正被另一个进程使用"），
+于是"cookie 里有 chatgpt.com 吗"会返回 **null**，而 null 很容易被误当成 false（进而推荐错的 profile）。
+改用**不依赖被锁文件**的证据：`IndexedDB\https_chatgpt.com_0.indexeddb.leveldb`
+（目录名自带 origin）+ `Local Storage\leveldb\*` 里的明文 origin。
+拿不到任何证据时如实返回 `null`（unknown），**不返回 false**。
+
+## 六、生图任务实机验证（2026-09-20，Windows）
+
+需求：**在聊天流程里让 GPT 生图，并把图片下载到本地文件夹**；
+语义是"**一张图 = 一个 GPT 会话（新聊天）**"——每个会话发完提示词、等 URL 定型即可开下一个，
+同时最多 N 张在途，收图时按会话回取。
+
+### 关键取证（决定了实现方式）
+
+| 现象 | 实测证据 |
+|---|---|
+| 生图**成功**了 | 会话 JSON 里 `image_asset_pointer: sediment://file_0000000070d081fd8cdf5a4e751234ff`，`image/png`，`size_bytes: 791638`，`1254x1254` |
+| 但 **DOM 里没有图** | `conversation-turn-2` 内只有"编辑" + 空的 `data-conversation-screenshot-content`；全页只有 `image-gen-overlay-*` 空壳节点，无 `<img>`/`<canvas>`/背景图/iframe |
+| 后端 API 需要应用内 token | 只带 cookie 请求 `/backend-api/conversation/<id>` → **404 `conversation_inaccessible`**；带 `Authorization: Bearer`（来自 `/api/auth/session`，plus 账号）→ 200 |
+| 下载链路可用 | `/backend-api/files/<id>/download` → JSON `download_url` → GET 得 791638 B，魔数 `89504e470d0a1a0a`（PNG） |
+| URL 确实稳定 | 临时 `/c/WEB:<uuid>` → 约 15s 后换成正式 UUID，之后不再变（文本对话通常 1s 内定型） |
+| **页面切走不影响生成** | 会话 B 刚定型就开 C（同一标签页导航走），B 仍在服务端生成完成并 `ready` |
+
+### 落地的命令与语义
+
+`image start`（开新会话 + 发提示词 + 等 URL 定型 + 记账，**不等生成**）、
+`image list` / `image wait` / `image download [--all]` / `image run`。
+同时在途上限默认 10（`--max` / `CHATGPT_IMAGE_MAX` / config `imageMaxInFlight`），
+**"在途"= 还没被观测到完成的任务**：`image list/wait/download` 观测到出图后名额立即释放
+（这正好对应用户说的"前面生成完后面又可以补充进去"）；落盘
+`<CHATGPT_OUT_DIR>/<jobId>/<序号>-<服务端文件名>.<ext>` + `images.json`。
+
+### 本轮实机发现并修掉的缺陷
+
+| # | 缺陷 | 根因（实测） | 修法 |
+|---|---|---|---|
+| 1 | `wait` 直接崩：`Execution context was destroyed` | 生成中途页面导航（临时 URL → 正式 UUID / 整页重载），`page.evaluate` 抛错被当成失败 | 采样与双采样都容忍导航（连续失败上限后才报 `ui_changed`） |
+| 2 | 生图任务误报 `NOT_LOGGED_IN` | 新标签页 `domcontentloaded` 时 composer 还没渲染，`isLoggedIn` 只看 `#prompt-textarea` | 开新会话/新标签页后**等 composer 出现**再判定 |
+| 3 | 附件 chip 检测失败（`inForm: 0`，`inputFiles: 1`） | 页面有 **5 个 file input**；`input[type=file]` 的 `.first()` 顺序依赖，文件被"照片"通道吃掉，chip 不渲染 | 显式投给 `#upload-files`（兜底 `input[type=file]:not([accept])`），并在返回值里带 `attachInput` |
+| 4 | 修 #3 后**仍然**检测失败 | 草稿里的同名附件跨"新聊天"保留 → ChatGPT 去重重命名为 `attach(2).md`，而匹配用的是**精确文件名** | 匹配容忍 `(n)` 后缀，并把 `attachmentsRenamed` 作为"草稿里本来就有同名附件"的证据上报 |
+| 5 | 生图收图拿到 0 张图 | 见上表"DOM 里没有图" | 改走会话 JSON + `/files/<id>/download`（并且**不解密、不导出凭证**） |
+
+### 验证结果（真实生成 + 落盘 + 像素核对）
+
+- 三个任务并行（A 绿圆 9 / B 橙三角 / C 紫五角星），`image wait --all` 全部 `ready`；
+  B 是在"页面已被 C 切走"的情况下照样生成完的。
+- `image download --all` 落盘 3 个 PNG，`verified: true`（下载字节 == 服务端 `size_bytes`），
+  `images.json` 记录 fileId/尺寸/校验。
+- 用浏览器把 PNG 解码后采样像素核对内容：绿圆 center `rgb(2,172,7)`、橙三角 center `rgb(254,129,6)`、
+  紫五角星 center `rgb(141,5,212)`，四角均为近白 —— 与提示词一致（不依赖任何图像库）。
+- 上限闸门：在途 1 时 `--max 1` → `IMAGE_LIMIT_REACHED`（不消耗生成）；下载后 in-flight 归 0，
+  再 `--max 1` 即可继续 start。
+- 重构 `send`/DOM 层（抽到 `compose.mjs`）后**回归复测**普通对话 + 附件：`attachmentReady: true`，
+  GPT 再次回读了附件里的 `ALPHA-7788`。
+
+### 工程教训（Windows 专属，踩了两次）
+
+- **不要用 PowerShell 的 `Get-Content -Raw` + `Set-Content` 改写源码**：Windows PowerShell 默认按
+  系统 ANSI（本机 CP936）读 UTF-8 文件 → 中文被转成 mojibake、不可逆处变成 `?`，写回时还带 BOM
+  破坏 shebang。本轮 `scripts/chatgpt.mjs` 就是这样被写坏（352 个 U+FFFD），只能 `git checkout` 后重做。
+  结论：**改文件用 UTF-8 安全的编辑器/工具；要校验就 `node --check` + 统计 U+FFFD**。
+
+## 七、生图取图：三条路的实测对比（2026-09-20，第二轮）
+
+起因是有人问："为什么不模拟点击图片 → 点图片的下载？" 我们按"先取证再设计"重做了一轮：
+
+| 问题 | 实测答案 |
+|---|---|
+| 后台标签页里图片在 DOM 吗？ | **不在**。只有空的 `image-gen-overlay-*` 壳节点，全页无 `<img>`/`<canvas>`/背景图/iframe |
+| 前台呢？ | **在**：`page.bringToFront()` 后同一会话出现 3 个 `<img src="…/backend-api/estuary/content?id=file_…">`，`naturalSize 1254x1254`；但**冷加载要轮询 ~24s** 才出现 |
+| 有"图片下载"按钮吗？ | **没有**。图片 overlay 只有 `编辑图片` / `分享此图片`；会话"更多操作"只有 `查看聊天中的文件/分享/置顶聊天/归档/删除/移至项目`；唯一含"下载"的是无关的 `下载应用` |
+| 点图片会开灯箱吗？ | 不会（无 `role=dialog` / lightbox 出现） |
+| estuary URL 需要 token 吗？ | **不需要**（浏览器渲染图片用的就是 cookie）。但**会话 JSON** 需要 `Bearer accessToken`，只带 cookie 会 404 `conversation_inaccessible` |
+| 三条路字节一致吗？ | **完全一致**：cookie-only == with-token == `/files/<id>/download`，`bytes=723875`、`sha256=26d831a6638d3f9f…` |
+| 耗时对比 | api ≈ 2s（不碰页面）；dom ≈ **50.4s** 且要抢前台；native = 按钮不存在 |
+
+据此落地 `image download --mode api|dom|native|auto`：
+- 默认 **api**（主线、无人值守）；`dom`/`native` 必须显式 `--allow-ui`，否则 `FOREGROUND_REQUIRED`；
+- UI 路径独占浏览器（抢全局锁，占用时 `status: busy`）；
+- `auto` = api → （仅在 `--allow-ui` 时）dom；**绝不静默走 native 点击**；
+- 返回值带 `mode` / `fileId` / `bytes` / `sha256`，便于跨路径对比复现。
+
+### 本轮修掉的缺陷
+
+| # | 缺陷 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 之前文档断言"生图不要抓 DOM，DOM 里没有图"**不准确** | 当时标签页一直在后台；前台是会渲染的 | 改为"后台不渲染、前台渲染但要等 ~25s"，并保留 api 为默认（后台/无人值守仍不该抓 DOM） |
+| 2 | `native` 模式错报 `DOWNLOAD_EVENT_TIMEOUT` | 宽松选择器 `[aria-label*='下载']` 命中了无关的 **`下载应用`**（Download app），点了它自然等不到 download 事件 | 选择器收窄为 data-testid / 精确 label / overlay 范围，排除"下载应用"；没有真按钮时如实返回 `NATIVE_ACTION_UNAVAILABLE` |
+| 3 | UI 路径可能偷偷抢用户前台 | 最初实现无门禁 | 加 `--allow-ui` 硬门禁 + 全局锁 + `FOREGROUND_REQUIRED` |
+
+### 与 GPT 的协作结论（其中一次调用就是本 skill 自己发起的）
+
+GPT 的判断与实测一致：**API 做主链路，原生点击只做诊断/兜底**（UI 依赖前台渲染、按钮存在性、
+hover、文案漂移，还会抢用户焦点；`connectOverCDP` 官方也属较低 fidelity）。
+它同时给了可用建议并被采纳：`--mode api|native` 显式化、`--allow-ui` 门禁、
+先监听 `download` 事件再点击、返回 `mode/fileId/path/bytes/sha256`、
+以及**分层测试判据**（①事件/HTTP 成功 ②魔数+尺寸+字节数 ③重复下载 SHA 稳定
+④跨路径 SHA 相同作为强证据但不硬性要求字节一致）。
+风控上它指出：没有证据表明"模拟点击更安全"，真正该控的是频率/并发/会话 churn。
+
+## 八、仍未解决 / 未验证（诚实清单）
+
+- **登录态跨机迁移**：无法程序化完成，每台新机器需用户登录一次（或绑定用户已有的登录 profile，
+  见 `init`）。已用 `doctor` 把这一步显性化。
+- **Windows / Linux**：Windows 已实机验证（见上）；**Linux 仍未实机验证**。
 - **AppleScript 备选通道**：仅 macOS；需用户手动开启"允许 Apple 事件中的 JavaScript"；附件上传不可靠。
 - **路由阈值未校准**：`route` 的 4/2 阈值、`method` 的 7 信号映射，均来自设计推理 + 三轮压测，
   **未用真实任务回放校准**（方法见 `THINKING.md` 第 9 节）。
 - **`cancel` / `read --after`**：已在协议里定义语义，尚未实现。
-- **项目身份校验**：未用真实项目做端到端验证（当前以 URL 的 `projectId` 为权威判据）。
-- **并发实例未压测**：实例隔离逻辑已实测端口/profile 分离，但**未做多 agent 真实并发压测**。
+- **图片生成落盘**：已实机验证（第六、七节）。仍**未**验证：一次返回 2 张以上的多图会话、
+  图生图（`--file` 传参考图）、以及 `read --save` 这条旧的 DOM 抓图路径。
+- **`native` 模式**：当前 UI 无下载按钮，只验证到"如实报 `NATIVE_ACTION_UNAVAILABLE`"；
+  一旦 UI 加上按钮，`download` 事件路径需要重新实机验证。
+- **Deep Research**：正文在 iframe 内，`read` 取不到；未实机验证。
+- **`project` 项目上下文**：未在 Windows 实机验证（当前以 URL 的 `projectId` 为权威判据）。
+- **"开机即用"未落地**：目前靠用户/上层显式 `launch`。要让那个已登录 profile 在开机后自动带调试端口启动，
+  需在 Windows 上做快捷方式/登录时计划任务（参数必须与 `config` 输出一致）；本仓库不代为创建系统级任务。

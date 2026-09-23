@@ -6,8 +6,22 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   launchChrome, connect, getPage, isLoggedIn, waitForCompletion, acquireLock, releaseLock,
-  SELECTORS, sleep, convIds, readTabs, writeTabs, cdpAlive, CDP_URL, PROFILE, AGENT, CDP_PORT, CHROME,
+  sleep, convIds, readTabs, writeTabs, cdpAlive, CDP_URL, PROFILE, AGENT, CDP_PORT, CHROME,
+  BINDING, SKILL_DIR, PROFILE_DIRECTORY, CHROME_SOURCE, CHROME_MISSING, checkCdpProfile,
+  listInstalledBrowsers, openNewChat,
 } from './lib.mjs';
+import {
+  CONFIG_FILE, readConfig, writeConfig, describeBinding, detectProfiles, resolveBinding,
+} from './config.mjs';
+import { scanBrowserProcesses, samePath } from './procs.mjs';
+import {
+  SELECTORS, fillComposer, composerText, waitSendReady, submitComposer, lastAssistant,
+  setDocumentFiles, probeAttachments,
+} from './compose.mjs';
+import {
+  loadJobs, saveJobs, findJob, inFlight, newJobId, jobStatus, downloadAssets,
+  downloadAssetsViaDom, downloadAssetsViaNative, DEFAULT_MAX_IN_FLIGHT,
+} from './images.mjs';
 
 const OUT_DIR = process.env.CHATGPT_OUT_DIR || path.join(process.cwd(), 'chatgpt-out');
 const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
@@ -51,12 +65,20 @@ const STATES = {
   auth_required: 'FAILED', rate_limit: 'FAILED', network_error: 'FAILED',
   ui_changed: 'FAILED', empty_response: 'FAILED', no_response_started: 'FAILED',
   NOT_LOGGED_IN: 'FAILED', NO_CDP: 'FAILED',
+  // 机器级绑定相关（见 config.mjs）：不猜、不降级，如实上报，让用户决定
+  CHROME_NOT_FOUND: 'FAILED', SPAWN_FAILED: 'FAILED', CDP_TIMEOUT: 'FAILED',
+  PROFILE_MISMATCH: 'FAILED', PROFILE_IN_USE_NO_CDP: 'FAILED', PROFILE_IN_USE_OTHER_PORT: 'FAILED',
+  CONFIG_ERROR: 'FAILED',
+  IMAGE_LIMIT_REACHED: 'FAILED', IMAGE_JOB_NOT_FOUND: 'FAILED',
+  FOREGROUND_REQUIRED: 'FAILED', NATIVE_ACTION_UNAVAILABLE: 'FAILED', IMAGE_ASSET_NOT_FOUND: 'FAILED',
 };
 
 function envelope(obj) {
   if (!obj || typeof obj !== 'object') return obj;
   const code = obj.status || obj.error || (obj.ok === false ? 'failed' : 'success');
-  return {
+  // 协议字段必须**覆盖** payload：payload 里同名的业务字段会顶掉协议状态码
+  // （2026-09-20 实测：read 的 code 是代码块数组，于是 `code` 变成了 []，状态码被吃掉）。
+  const protocol = {
     protocol_version: PROTOCOL_VERSION,
     ok: obj.ok !== false,
     code: String(code),
@@ -64,8 +86,8 @@ function envelope(obj) {
     request_id: obj.requestId ?? null,
     project_id: obj.projectId ?? null,
     conversation_id: obj.conversationId ?? null,
-    ...obj,
   };
+  return { ...obj, ...protocol };
 }
 
 function emit(obj, args) {
@@ -76,65 +98,8 @@ function emit(obj, args) {
 }
 
 // ---------- DOM 操作 ----------
-// 注意：这些函数在**页面上下文**里执行，不能引用外部变量，所以选择器在函数内自带回退链。
-// 与 lib.mjs 的 SELECTORS 保持一致：语义属性优先 + 旧版兜底。
-const COMPOSER_SEL = "div.ProseMirror[role='textbox'], [contenteditable='true'][role='textbox'], #prompt-textarea, textarea[name='prompt-textarea'], [contenteditable='true']";
-const SEND_SEL = "button[data-testid='send-button'], button[aria-label='Send'], button[aria-label='发送'], button[aria-label='发送提示'], form button[type='submit']";
-const STOP_SEL = "button[data-testid='stop-button'], button[aria-label='Stop'], button[aria-label='停止'], button[aria-label='停止回答']";
-
-const js = {
-  insertText: (text) => {
-    const el = document.querySelector("div.ProseMirror[role='textbox']")
-      || document.querySelector("[contenteditable='true'][role='textbox']")
-      || document.querySelector('#prompt-textarea')
-      || document.querySelector("textarea[name='prompt-textarea']")
-      || document.querySelector("[contenteditable='true']");
-    if (!el) return { ok: false, error: 'composer-not-found' };
-    el.focus();
-    const dt = new DataTransfer();
-    dt.setData('text/plain', text);
-    el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
-    return { ok: true, len: (el.innerText || el.value || '').length };
-  },
-  composerText: () => {
-    const el = document.querySelector("div.ProseMirror[role='textbox']")
-      || document.querySelector("[contenteditable='true'][role='textbox']")
-      || document.querySelector('#prompt-textarea')
-      || document.querySelector("textarea[name='prompt-textarea']")
-      || document.querySelector("[contenteditable='true']");
-    return el ? (el.innerText || el.value || '') : null;
-  },
-  sendInfo: () => ({
-    send: !!document.querySelector("button[data-testid='send-button']")
-      || !!document.querySelector("button[aria-label='Send']")
-      || !!document.querySelector("button[aria-label='发送']")
-      || !!document.querySelector("form button[type='submit']"),
-    stop: !!document.querySelector("button[data-testid='stop-button']")
-      || !!document.querySelector("button[aria-label='Stop']")
-      || !!document.querySelector("button[aria-label='停止']"),
-  }),
-  lastAssistant: () => {
-    // 新版优先：助手正文是 MarkdownRoot；轮次容器是 [data-turn-key]
-    // 旧版兜底：conversation-turn + data-message-author-role
-    const mdBodies = [...document.querySelectorAll('div[class*="MarkdownRoot-"]')];
-    const legacy = [...document.querySelectorAll("[data-message-author-role='assistant']")];
-    const asst = mdBodies.length ? mdBodies[mdBodies.length - 1] : legacy[legacy.length - 1];
-    if (!asst) return null;
-    const turns = document.querySelectorAll("[data-turn-key], [data-testid^='conversation-turn-']");
-    const imgs = [...asst.querySelectorAll('img')]
-      .map((i) => ({ src: i.currentSrc || i.src, alt: i.alt || '', w: i.naturalWidth, h: i.naturalHeight }))
-      .filter((i) => i.src && !/avatar|profile|emoji|icon/i.test(i.src));
-    const codes = [...asst.querySelectorAll('pre')].map((p) => {
-      const code = p.querySelector('code');
-      const lang = code?.className?.match(/language-([\w+-]+)/)?.[1] || '';
-      return { lang, text: (code || p).innerText };
-    });
-    return {
-      text: asst.innerText || '', imgs, codes,
-      turnIndex: turns.length, assistantIndex: (mdBodies.length || legacy.length),
-    };
-  },
-};
+// 全部收敛到 scripts/compose.mjs（与生图任务共用同一份选择器与注入/提交逻辑，
+// 改版时不会出现"改一处漏一处"）。说明见该文件顶部。
 
 async function withPage(fn, { create = true } = {}) {
   const browser = await connect();
@@ -149,14 +114,58 @@ async function withPage(fn, { create = true } = {}) {
 
 async function cmdLaunch(args) {
   const r = await launchChrome({ headless: args.headless === true });
-  if (r.reason === 'already-running') return { ok: true, launched: false, cdp: CDP_URL };
-  if (!r.ok && !CHROME) {
+  const base = {
+    cdp: CDP_URL, browser: CHROME, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileSource: BINDING.sources.userDataDir,
+    agent: AGENT, configFile: BINDING.file,
+  };
+
+  if (r.reason === 'already-running') {
+    return { ok: true, launched: false, profileVerified: r.profileVerified ?? null, ...base };
+  }
+  if (r.reason === 'chrome-not-found') {
     return {
-      ok: false, error: 'chrome-not-found', platform: process.platform,
-      hint: '没找到 Chrome/Chromium。装一个浏览器，或用 CHATGPT_CHROME=<可执行文件绝对路径> 指定。',
+      ok: false, error: 'CHROME_NOT_FOUND', platform: process.platform, ...base,
+      hint: CHROME_MISSING
+        ? `绑定的浏览器路径不存在：${BINDING.keys.browserPath}。用 init 重新绑定，或修正 ${BINDING.file}`
+        : '没找到 Chrome/Chromium/Edge。装一个浏览器，或用 init --browser <绝对路径> 绑定。',
     };
   }
-  return { ok: r.ok, launched: true, cdp: CDP_URL, profile: PROFILE, agent: AGENT };
+  if (r.reason === 'profile-mismatch') {
+    return {
+      ok: false, error: 'PROFILE_MISMATCH', ...base,
+      liveProfile: r.liveProfile, liveProfileDirectory: r.liveProfileDirectory,
+      hint: `CDP ${CDP_URL} 上跑的不是绑定的 profile。要么关掉那个实例（不要杀用户日常浏览器），要么把它启动成绑定的 profile：init --user-data-dir "${PROFILE}"`,
+    };
+  }
+  if (r.reason === 'profile-in-use') {
+    const holderPort = r.holder?.cdpPort ?? null;
+    const manual = `"${CHROME}" --remote-debugging-port=${CDP_PORT} --user-data-dir="${PROFILE}"`
+      + (PROFILE_DIRECTORY ? ` --profile-directory=${PROFILE_DIRECTORY}` : '');
+    return {
+      ok: false,
+      error: holderPort ? 'PROFILE_IN_USE_OTHER_PORT' : 'PROFILE_IN_USE_NO_CDP',
+      holderCdpPort: holderPort,
+      holder: r.holder ? { commandLine: r.holder.commandLine } : null,
+      ...base,
+      hint: holderPort
+        ? `绑定的 profile 已被另一个可调试实例占用（端口 ${holderPort}，不是本实例的 ${CDP_PORT}）。`
+          + `同一个 profile 同时只能有一个可调试实例：要么关掉那个实例，要么让本实例复用端口 ${holderPort}`
+          + `（多宿主共享同一个 profile 时不要用不同 agent 名）。手工启动： ${manual}`
+        : `绑定的 profile 正被一个没有调试端口的浏览器占用，再启动也拿不到 CDP。`
+          + `请让用户用绑定参数重启那个实例（或先关掉它），不要杀掉用户的日常浏览器。手工启动： ${manual}`,
+    };
+  }
+  if (r.reason === 'spawn-failed') {
+    return { ok: false, error: 'SPAWN_FAILED', detail: r.detail, ...base, hint: '浏览器没能启动，先手工执行一次看报错' };
+  }
+  if (r.reason === 'cdp-timeout') {
+    return {
+      ok: false, error: 'CDP_TIMEOUT', ...base,
+      hint: `浏览器进程起来了但 ${CDP_URL} 没开（可能同一个 profile 已被别的实例占用，或调试端口被策略禁用）`,
+    };
+  }
+  return { ok: r.ok, launched: true, profileVerified: r.profileVerified ?? null, ...base };
 }
 
 // ---------- 新机器预检 ----------
@@ -167,15 +176,41 @@ async function cmdDoctor() {
   const steps = [];
   const add = (name, status, detail, action) => steps.push({ name, status, detail, action });
 
-  // 1) 浏览器可执行文件
-  add('browser-binary', CHROME ? 'ok' : 'fail',
-    CHROME || `未找到（platform=${process.platform}）`,
-    CHROME ? null : '安装 Chrome，或设置 CHATGPT_CHROME=/path/to/chrome');
+  // 0) 机器级绑定：决定"用哪个浏览器 + 哪个已登录 profile"（这是本 skill 最容易被搞错的一环）
+  const cfg = readConfig(BINDING.file);
+  add('binding-config', cfg.error ? 'fail' : (cfg.exists ? 'ok' : 'warn'),
+    cfg.error ? `${BINDING.file}：${cfg.error}`
+      : (cfg.exists ? BINDING.file : `没有机器配置，正在用 env/默认值：${BINDING.file}`),
+    cfg.error ? '修好这个 JSON，或删掉它重新 init'
+      : (cfg.exists ? null : 'chatgpt-web init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>"'));
 
-  // 2) CDP 实例
+  add('browser-binding', CHROME && !CHROME_MISSING ? 'ok' : 'fail',
+    `${CHROME || '未绑定'}（source=${CHROME_SOURCE}）`,
+    CHROME && !CHROME_MISSING ? null : 'chatgpt-web init --browser "<chrome.exe 绝对路径>"');
+
+  add('profile-binding', BINDING.keys.userDataDir ? 'ok' : 'warn',
+    `${PROFILE}${PROFILE_DIRECTORY ? `（--profile-directory=${PROFILE_DIRECTORY}）` : ''}（source=${BINDING.sources.userDataDir}）`,
+    BINDING.keys.userDataDir ? null
+      : '默认 profile 需要用户重新登录一次；想复用已登录的浏览器就跑 chatgpt-web init --user-data-dir "<那个 profile 目录>"');
+
+  // 1) CDP 实例 + 它用的 profile 是否就是绑定的那个
   const alive = await cdpAlive();
   add('cdp-instance', alive ? 'ok' : 'fail', `${CDP_URL}（agent=${AGENT}, port=${CDP_PORT}）`,
     alive ? null : '运行: chatgpt-web launch');
+
+  let profileCheck = { supported: false, liveProfile: null, matched: null };
+  if (alive) {
+    profileCheck = checkCdpProfile();
+    const st = profileCheck.matched === true ? 'ok' : (profileCheck.matched === false ? 'fail' : 'unknown');
+    add('profile-match', st,
+      profileCheck.matched === true ? `CDP 实例用的正是绑定 profile（${profileCheck.liveProfile}）`
+        : profileCheck.matched === false ? `CDP 实例用的是 ${profileCheck.liveProfile}，不是绑定的 ${PROFILE}`
+          : (profileCheck.supported ? '无法确定该实例用的是哪个 profile'
+            : `本平台（${process.platform}）拿不到浏览器进程信息，无法验证`),
+      profileCheck.matched === true ? null
+        : (profileCheck.matched === false ? '先把那个实例换成绑定 profile（见 launch 的 hint），或修正绑定'
+          : '可以继续，但 doctor 无法证明"用的就是这个 profile"'));
+  }
 
   // 3) 自动化 profile
   const profileExists = fs.existsSync(PROFILE);
@@ -218,29 +253,45 @@ async function cmdDoctor() {
   }
 
   const blocking = steps.filter((s) => s.status === 'fail' || s.status === 'needs-user');
-  const ready = loggedIn && !!CHROME;
+  const warnings = steps.filter((s) => s.status === 'warn' || s.status === 'unknown').map((s) => s.name);
+  const ready = loggedIn && !!CHROME && !CHROME_MISSING;
   return {
-    ok: true, ready, agent: AGENT, port: CDP_PORT, profile: PROFILE, currentUrl,
+    ok: true, ready, canRun: ready, agent: AGENT, port: CDP_PORT,
+    browser: CHROME || null, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileVerified: profileCheck.matched,
+    configFile: BINDING.file, binding: BINDING.keys, bindingSources: BINDING.sources,
+    bindingTable: describeBinding(BINDING), warnings, currentUrl,
     verdict: ready
       ? 'READY：可以直接调用网页版 GPT'
-      : (CHROME ? 'NEEDS-USER-ACTION：需要用户完成一次登录' : 'NOT-READY：先解决浏览器缺失'),
+      : (CHROME && !CHROME_MISSING ? 'NEEDS-USER-ACTION：需要用户完成一次登录' : 'NOT-READY：先解决浏览器/profile 绑定'),
     nextAction: ready
       ? 'chatgpt-web ask --text-file <prompt> --json'
-      : (!CHROME ? '安装 Chrome，或设置 CHATGPT_CHROME'
+      : ((!CHROME || CHROME_MISSING)
+        ? 'chatgpt-web init --browser "<chrome.exe 绝对路径>" --user-data-dir "<已登录 GPT 的 profile 目录>"'
         : (!alive ? 'chatgpt-web launch' : '让用户在弹出的 Chrome 窗口登录 ChatGPT，然后重跑 doctor')),
     blocking, steps,
   };
 }
 
 async function cmdStatus() {
+  const binding = {
+    browser: CHROME || null, browserSource: CHROME_SOURCE,
+    profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileSource: BINDING.sources.userDataDir,
+    port: CDP_PORT, agent: AGENT, configFile: BINDING.file,
+  };
   const alive = await cdpAlive();
-  if (!alive) return { ok: false, cdp: false, hint: 'node scripts/chatgpt.mjs launch' };
+  if (!alive) return { ok: false, cdp: false, ...binding, hint: 'node scripts/chatgpt.mjs launch' };
+  const check = checkCdpProfile();
   return withPage(async (page) => {
     const loggedIn = await isLoggedIn(page);
     const url = page.url();
     const ids = convIds(url);
     const title = await page.title();
-    return { ok: true, cdp: true, loggedIn, url, title, ...ids };
+    return {
+      ok: true, cdp: true, loggedIn, url, title,
+      profileVerified: check.matched, liveProfile: check.liveProfile,
+      ...binding, ...ids,
+    };
   });
 }
 
@@ -350,34 +401,21 @@ async function cmdSend(args) {
     const before = await page.locator(SELECTORS.assistant).count();   // assistant 消息数基线（无歧义）
 
     let uploaded = [];
+    let attachmentReady = null;
+    let attachInput = null;
+    let lastProbe = null;
     if (files.length) {
       const abs = files.map((f) => path.resolve(f));
       for (const f of abs) if (!fs.existsSync(f)) return { ok: false, error: 'file-not-found', file: f };
-      // 文件输入有 3 个（图片 / 媒体 / 通用），绝不能盲取 .first()：
-      // 新会话里第一个可能是 accept="image/*"，塞文件进去会被静默忽略（2026-09-23 实测）。
-      // 判据：优先 accept 含非图片类型的，退而取任意文件输入，最后才用第一个。
-      const pick = await page.evaluate(() => {
-        const inputs = [...document.querySelectorAll("input[type='file']")];
-        const info = inputs.map((el, i) => ({ i, accept: (el.getAttribute('accept') || ''), multiple: !!el.multiple }));
-        const nonImage = info.find((x) => x.accept && !/^image\//.test(x.accept));
-        const noAccept = info.find((x) => !x.accept);
-        return { count: info.length, chosen: (nonImage || noAccept || info[0] || {}).i ?? null, info };
-      });
-      if (pick.chosen === null) return { ok: false, error: 'file-input-not-found', probe: pick };
-      const input = page.locator("input[type='file']").nth(pick.chosen);
-      await input.setInputFiles(abs);
-      // 先记录 composer 里已有的附件：ChatGPT 会跨运行累积，且重名会自动改名为 name(1).md。
-      // 因此"精确文件名匹配"会失败——必须按 basename 主干匹配（见下）。
+      // composer 会跨运行累积附件，且发送时会一起带出——会让上层拿到"不是它要求"的请求。
+      // 先记录草稿里已有的附件：
+      //   a) 真脏状态：上一次运行/别的任务留下的附件（危险，必须拦）
+      //   b) 本次自己的残留：上一次 send 未确认提交、文本与附件仍在 composer（安全，重试即可）
+      // 判据：tabs.json 里是否记录了本会话上一次未完成的发送（pendingText 非空）。
       const preexisting = await page.evaluate(() => {
         const txt = document.querySelector('form')?.innerText || '';
         return (txt.match(/[^\s|]+\.(?:md|txt|pdf|docx?|png|jpe?g|csv|json|zip|xlsx?)/gi) || []);
       });
-      // composer 会跨运行累积附件，且发送时会一起带出——会让上层拿到"不是它要求"的请求。
-      //
-      // 但要区分两种"已存在"：
-      //   a) 真脏状态：上一次运行/别的任务留下的附件（危险，必须拦）
-      //   b) 本次自己的残留：上一次 send 未确认提交、文本与附件仍在 composer（安全，重试即可）
-      // 判据：tabs.json 里是否记录了本会话上一次未完成的发送（pendingText 非空）。
       const prevTabs = readTabs();
       const retryOwnDraft = typeof prevTabs.pendingText === 'string' && prevTabs.pendingText.length > 0;
       if (preexisting.length && args['allow-preexisting'] !== true && !retryOwnDraft) {
@@ -387,105 +425,54 @@ async function cmdSend(args) {
             + '处理：先 new 开新会话，或重载页面再试；确认无碍可加 --allow-preexisting。',
         };
       }
+      // 必须投给**文档**附件输入框：页面上另有图片/视频输入框（accept="image/*" 等），
+      // 用 `.first()` 会随 DOM 顺序把文件塞进"照片"通道，chip 不渲染（2026-09-23 实测；
+      // 2026-09-20 在另一台机器上也踩到过同一坑）。
+      const put = await setDocumentFiles(page, abs);
+      if (put.error) return { ok: false, error: put.error };
       uploaded = abs;
+      attachInput = put.input;
       // 等附件 chip 真正渲染完成再发送，否则会发出空附件消息。
-      // 关键：用 basename 主干匹配，兼容 ChatGPT 的 name(1).md 自动重命名。
-      // 同时注意新版会先显示 "Uploading"，必须等它消失。
-      const stems = abs.map((f) => {
-        const base = path.basename(f);
-        const dot = base.lastIndexOf('.');
-        return (dot > 0 ? base.slice(0, dot) : base).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      });
+      // 检测要宽：只看 form/body 的文本在 UI 忙时会超时（e2e 里实测）；
+      // 并且必须容忍同名去重重命名（attach.md → attach(2).md，见 compose.probeAttachments）。
+      const names = abs.map((f) => path.basename(f));
       let chipReady = false;
-      let lastProbe = null;
       for (let i = 0; i < 60; i++) {            // 最长 30s
-        lastProbe = await page.evaluate((ss) => {
-          const formTxt = document.querySelector('form')?.innerText || '';
-          const bodyTxt = document.body.innerText || '';
-          const hit = (t) => ss.filter((s) => new RegExp(s + '(?:\\(\\d+\\))?\\.[a-z0-9]+', 'i').test(t)).length;
-          return {
-            matchedInForm: hit(formTxt),
-            matchedInBody: hit(bodyTxt),
-            uploading: /Uploading|上传中/.test(formTxt),
-          };
-        }, stems);
-        const seen = lastProbe.matchedInForm >= stems.length || lastProbe.matchedInBody >= stems.length;
-        if (seen && !lastProbe.uploading) { chipReady = true; break; }
+        lastProbe = await probeAttachments(page, names);
+        if (lastProbe.inForm >= names.length || lastProbe.inBody >= names.length) { chipReady = true; break; }
         await sleep(500);
       }
       if (!chipReady) {
         return {
           ok: false, error: 'attachment-not-confirmed', uploadedCount: 0,
-          expected: stems, probe: { ...lastProbe, inputChoice: pick, preexisting },
-          hint: '附件未能确认就绪（仍在 Uploading 或 UI 改版）。本次未发送消息，避免发出空附件。',
+          expected: names, probe: { ...lastProbe, attachInput, preexisting },
+          hint: '附件已提交给页面但未确认渲染（可能是上传过慢或 UI 改版）。本次未发送消息，避免发出空附件。',
         };
       }
+      // chip 出现 ≠ 上传完成：上传未完成时发送按钮是 aria-disabled（disabled 属性仍是 false），
+      // 此时坐标点击会被 UI 直接忽略（2026-09-20 Windows 实测：带附件必然走到 Enter 兜底并白等 10s）。
+      // 所以这里等按钮真正可用；等不到也不硬等，如实记录 ready=false 后走 Enter。
+      attachmentReady = await waitSendReady(page);
       await sleep(600);
     }
 
     if (text) {
-      const r = await page.evaluate(js.insertText, text);
-      if (!r.ok) return { ok: false, error: r.error };
-      // 确认文字真的进入 composer（受控组件可能没吃下 paste 事件）。
-      // 必须轮询：ProseMirror 提交内容是异步的，立刻回读会读到空串
-      // （2026-09-20 实测：5KB prompt 注入后 100ms 内才生效）。
-      const want = Math.min(3, text.trim().length);
-      let got = '';
-      for (let i = 0; i < 20; i++) {
-        got = await page.evaluate(js.composerText);
-        if (got && got.trim().length >= want) break;
-        await sleep(150);
-      }
-      if (!got || got.trim().length < want) {
-        return { ok: false, error: 'composer-not-filled', composerText: got, wanted: want };
-      }
+      // 注入 + 回读校验（ProseMirror 异步，读一次就断言不算）
+      const filled = await fillComposer(page, text);
+      if (!filled.ok) return { ok: false, ...filled };
     }
     await sleep(300);
 
-    // 提交：先点发送按钮，未生效则连续两次回退 Enter。
-    // 只尝试一次就报失败会漏掉"按钮点击被附件 chip/浮层吃掉"的常见情况。
-    const confirm = async (tries = 30) => {
-      for (let i = 0; i < tries; i++) {
-        const info = await page.evaluate(js.sendInfo);
-        const ct = await page.evaluate(js.composerText);
-        const cleared = !ct || ct.trim() === '';
-        if (info.stop || cleared) return { ok: true, stop: info.stop, cleared };
-        await sleep(500);
-      }
-      return { ok: false };
-    };
-
-    const attempts = [];
-    let submitted = false;
-    const send = page.locator(SELECTORS.send).first();
-    if (await send.count()) {
-      await send.click({ force: true }).catch((e) => attempts.push('click-error:' + e.message));
-      const r = await confirm(20);
-      attempts.push({ via: 'button', ...r });
-      submitted = r.ok;
-    }
-    if (!submitted) {
-      await page.locator(SELECTORS.composer).first().click().catch(() => {});
-      await sleep(200);
-      await page.keyboard.press('Enter');
-      const r = await confirm(20);
-      attempts.push({ via: 'enter', ...r });
-      submitted = r.ok;
-    }
-    if (!submitted) {
-      await page.keyboard.press('Enter');   // 第二次 Enter（部分 UI 需要先聚焦后第二次才生效）
-      const r = await confirm(20);
-      attempts.push({ via: 'enter-retry', ...r });
-      submitted = r.ok;
-    }
+    // 提交：按钮优先，不可用或未生效则回退 Enter（每一步证据留在 attempts 里）
+    const { attempts, submitted } = await submitComposer(page, { attachmentReady });
 
     // 记录本次请求基线：wait 只认"基线之后新增的 assistant 消息"，避免读到历史回答。
     //
-    // 注意 URL 会漂移：新聊天先给临时 /c/WEB:<uuid>，几百毫秒后替换为最终 /c/<uuid>。
-    // 只记录稳定的最终 UUID；若仍是临时 id，短暂轮询等它定型（最多 4s）。
+    // 注意 URL 会漂移：新聊天先给临时 /c/WEB:<uuid>，随后替换为最终 /c/<uuid>。
+    // 生图场景实测要 ~15s 才定型（文本对话通常 1s 内），所以这里给 20s 窗口；定型即退出。
     let ids = convIds(page.url());
     if (ids.temporary) {
-      for (let i = 0; i < 10 && ids.temporary; i++) {
+      for (let i = 0; i < 50 && ids.temporary; i++) {
         await sleep(400);
         ids = convIds(page.url());
       }
@@ -504,7 +491,10 @@ async function cmdSend(args) {
     const result = {
       ok: submitted, submitted, attempts,
       uploaded, uploadedCount: uploaded.length,
+      attachmentReady, attachInput,
+      attachmentsRenamed: lastProbe?.renamed ?? null,
       baselineAssistant: before,
+      // pendingText 已在上面算好并写进 tabs（供下次 send 区分"自己的残留"与"真脏状态"）
       pendingText,
       url, ...ids, turnsBefore: before,
       requestId, ...budget,
@@ -554,12 +544,12 @@ async function cmdRead(args) {
   // 这是整个设计里最值钱的一层隔离：GPT 可以写很多，dsh 不必全部消费。
   const maxChars = args['max-chars'] === undefined ? BUDGET.readDefault : Number(args['max-chars']);
   return withPage(async (page) => {
-    const last = await page.evaluate(js.lastAssistant);
+    const last = await lastAssistant(page);
     if (!last) return { ok: false, error: 'no-assistant-message' };
     const full = last.text || '';
     const truncated = maxChars > 0 && full.length > maxChars;
     const text = truncated ? full.slice(0, maxChars) : full;
-    const out = { ok: true, text, ...convIds(page.url()), turnIndex: last.turnIndex,
+    const out = { ok: true, text, url: page.url(), ...convIds(page.url()), turnIndex: last.turnIndex,
       images: last.imgs.map((i) => i.src), codeBlocks: last.codes.length,
       code: last.codes.map((c) => ({ lang: c.lang, bytes: c.text.length })),
       responseChars: full.length, readChars: text.length, truncated,
@@ -818,21 +808,416 @@ async function cmdAsk(args) {
   return {
     ok: true,
     url: send.url, projectId: send.projectId, conversationId: send.conversationId,
-    uploaded: send.uploaded, elapsedMs: wait.elapsedMs, viaFallback: wait.viaFallback,
+    uploaded: send.uploaded, attempts: send.attempts, attachmentReady: send.attachmentReady,
+    pendingText: send.pendingText,
+    elapsedMs: wait.elapsedMs, viaFallback: wait.viaFallback,
     text: read.text, images: read.images, codeBlocks: read.codeBlocks,
     savedImages: read.savedImages, savedMarkdown: read.savedMarkdown,
   };
 }
 
+// ---------- 机器级初始化（本机专属，配置不进仓库）----------
+// 每台机器都要显式回答一次："用哪个浏览器 + 哪个**已经登录过 GPT** 的 profile"。
+// 不猜、不降级、不新建 profile 让用户重复登录：重复登录有风控风险（见 REVIEW.md）。
+async function cmdInit(args) {
+  const wantBrowser = typeof args.browser === 'string' ? args.browser : null;
+  const wantProfile = typeof args['user-data-dir'] === 'string' ? args['user-data-dir'] : null;
+  const wantProfileDir = typeof args['profile-directory'] === 'string' ? args['profile-directory'] : null;
+  const wantPort = args.port !== undefined ? Number(args.port) : undefined;
+  const wantAgent = typeof args.agent === 'string' ? args.agent : null;
+  const dryRun = args['dry-run'] === true;
+  const force = args.force === true;
+
+  const cur = readConfig(CONFIG_FILE);
+  const patch = {};
+  if (wantBrowser) patch.browserPath = wantBrowser;
+  if (wantProfile) patch.userDataDir = wantProfile;
+  if (wantProfileDir) patch.profileDirectory = wantProfileDir;
+  if (wantPort !== undefined && !Number.isNaN(wantPort)) patch.cdpPort = wantPort;
+  if (wantAgent) patch.agent = wantAgent;
+
+  // 不带参数 = 只探测并给出建议命令（探测结果含"哪个 profile 有 ChatGPT 使用痕迹"）
+  if (!Object.keys(patch).length) {
+    const scan = scanBrowserProcesses();
+    const runningDirs = scan.supported
+      ? [...new Set(scan.entries.map((e) => e.userDataDir).filter(Boolean))]
+      : [];
+    const profiles = detectProfiles({ extraDirs: runningDirs });
+    const browsers = listInstalledBrowsers();
+    // 建议优先级：非默认目录（Chrome 136+ 不给默认目录开调试端口）> 有 ChatGPT 痕迹 > 正在运行
+    const scored = profiles
+      .map((p) => ({
+        p,
+        score: (p.chatgptTrace === true ? 4 : 0) + (p.defaultUserDataDir ? -4 : 0)
+          + (runningDirs.some((d) => samePath(d, p.userDataDir)) ? 2 : 0),
+      }))
+      .sort((a, b) => b.score - a.score);
+    const best = scored.length ? scored[0].p : null;
+    const suggested = best && best.chatgptTrace === true && !best.defaultUserDataDir ? best : null;
+    return {
+      ok: true, wrote: false, configFile: CONFIG_FILE, configExists: cur.exists,
+      detected: {
+        browsers,
+        runningUserDataDirs: runningDirs,
+        profiles,
+        processScan: scan.supported ? 'supported' : `unsupported(${process.platform})`,
+      },
+      warnings: [
+        ...(profiles.some((p) => p.defaultUserDataDir && p.chatgptTrace === true)
+          ? ['检测到**默认** Chrome profile 里有 ChatGPT 痕迹：Chrome 136+ 不允许默认 user-data-dir 开调试端口，绑它连不上 CDP（要另建/指定一个非默认目录，并在其中登录一次）']
+          : []),
+        ...(profiles.some((p) => p.cookiesLocked)
+          ? ['有 profile 的 Cookies 正被运行中的浏览器独占，只能用无锁痕迹（IndexedDB/Local Storage）判断']
+          : []),
+      ],
+      suggestion: suggested
+        ? {
+          browserPath: browsers[0] || null,
+          userDataDir: suggested.userDataDir,
+          profileDirectory: suggested.profileDirectory,
+          evidence: suggested.chatgptEvidence,
+          reason: '这个 profile 有 ChatGPT 使用痕迹，且不是默认目录（能开调试端口）',
+        }
+        : null,
+      nextAction: suggested
+        ? `chatgpt-web init --browser "${browsers[0] || '<chrome.exe>'}" --user-data-dir "${suggested.userDataDir}"${suggested.profileDirectory ? ` --profile-directory "${suggested.profileDirectory}"` : ''}`
+        : '没探测到可用的"已登录且非默认目录"的 profile：请手工给出路径 init --browser <chrome.exe> --user-data-dir <已登录 GPT 的 profile 目录>',
+    };
+  }
+
+  if (cur.error) {
+    return { ok: false, error: 'CONFIG_ERROR', configFile: CONFIG_FILE, detail: cur.error, hint: '先修好这个 JSON，或删掉它再 init' };
+  }
+
+  // 显式绑定不允许被静默改掉
+  const conflicts = Object.entries(patch)
+    .filter(([k, v]) => cur.data[k] !== undefined && String(cur.data[k]) !== String(v))
+    .map(([k, v]) => ({ key: k, existing: cur.data[k], wanted: v }));
+  if (conflicts.length && !force) {
+    return {
+      ok: false, error: 'CONFIG_ERROR', configFile: CONFIG_FILE,
+      conflicts, existing: cur.data,
+      hint: '已有绑定且与本次不同：确认要改就加 --force（不会自动覆盖）',
+    };
+  }
+
+  // 路径必须真实存在，否则写进去只会让后续命令全部失败
+  const problems = [];
+  if (patch.browserPath && !fs.existsSync(patch.browserPath)) problems.push({ key: 'browserPath', value: patch.browserPath, reason: '文件不存在' });
+  if (patch.userDataDir && !fs.existsSync(patch.userDataDir)) problems.push({ key: 'userDataDir', value: patch.userDataDir, reason: '目录不存在' });
+  if (problems.length) {
+    return { ok: false, error: 'CONFIG_ERROR', problems, hint: '路径写错了？先跑 chatgpt-web init（不带参数）看探测结果' };
+  }
+
+  if (dryRun) {
+    return { ok: true, wrote: false, dryRun: true, configFile: CONFIG_FILE, wouldWrite: { ...cur.data, ...patch } };
+  }
+
+  const saved = writeConfig(patch, CONFIG_FILE);
+  const fresh = resolveBinding({ file: CONFIG_FILE, skillDir: SKILL_DIR });
+  return {
+    ok: true, wrote: true, configFile: saved.file, config: saved.data,
+    effective: fresh.keys, sources: fresh.sources,
+    nextAction: 'chatgpt-web launch && chatgpt-web doctor',
+    note: '这份配置是机器专属的，放在用户主目录，不会进 git，也不会被 skill 更新覆盖',
+  };
+}
+
+// 只读展示：现在实际会用哪个浏览器 / 哪个 profile，各自来自哪里
+async function cmdConfig() {
+  const cfg = readConfig(CONFIG_FILE);
+  const scan = scanBrowserProcesses();
+  const running = scan.supported
+    ? scan.entries.filter((e) => !e.child && e.userDataDir)
+      .map((e) => ({ userDataDir: e.userDataDir, profileDirectory: e.profileDirectory, cdpPort: e.cdpPort }))
+    : [];
+  return {
+    ok: !cfg.error,
+    error: cfg.error || undefined,
+    configFile: CONFIG_FILE, configExists: cfg.exists, config: cfg.data,
+    effective: BINDING.keys, sources: BINDING.sources, table: describeBinding(BINDING),
+    envOverrides: Object.fromEntries(Object.entries(BINDING.sources).filter(([, s]) => String(s).startsWith('env:'))),
+    runningInstances: running,
+    processScan: scan.supported ? 'supported' : `unsupported(${process.platform})`,
+    detectedBrowsers: listInstalledBrowsers(),
+    hint: cfg.exists ? null : '还没有机器配置：chatgpt-web init --browser "<chrome.exe>" --user-data-dir "<已登录 GPT 的 profile 目录>"',
+  };
+}
+
+// ---------- 生图任务：一个任务 = 一个 GPT 新会话（"窗口"），不是浏览器标签页 ----------
+// 流程（贴合用户实际操作习惯）：
+//   1) 在同一个标签页里开一个新聊天 → 发提示词 → 等 URL 定型（临时 WEB: id 变正式 UUID）→ 记账并立即返回；
+//   2) 可以立刻再开下一个新会话发下一张（默认同时最多 10 个在途；生成完并下载后空位自动释放）；
+//   3) 收图不需要"点回那个窗口"：按会话 id 直接读会话 JSON 并下载到本地文件夹
+//      （实测：会话被切走后 DOM 根本不渲染图片，而会话 JSON 永远是权威来源）。
+async function cmdImage(args) {
+  const sub = args._[0];
+  const store = loadJobs();
+  const outDir = path.resolve(args.out || OUT_DIR);
+
+  const listView = async (page) => {
+    const rows = [];
+    for (const j of store.jobs) {
+      if (j.state === 'downloaded' && args.all !== true) {
+        rows.push({
+          jobId: j.jobId, state: 'downloaded', conversationId: j.conversationId,
+          url: j.url, files: j.files || [],
+        });
+        continue;
+      }
+      let st = { state: j.state };
+      if (j.conversationId && page) {
+        try {
+          st = { ...await jobStatus(page, j), jobId: j.jobId, conversationId: j.conversationId };
+        } catch (e) { st = { state: 'unknown', error: e.message.slice(0, 120) }; }
+      }
+      rows.push({
+        jobId: j.jobId, conversationId: j.conversationId, url: j.url,
+        createdAt: j.createdAt, ...st,
+      });
+      if (j.conversationId && st.state === 'ready' && j.state !== 'ready') {
+        j.state = 'ready'; j.readyAt = new Date().toISOString(); j.images = st.images;
+      }
+    }
+    saveJobs(store);
+    return rows;
+  };
+
+  if (sub === 'start') {
+    let text = args.text ?? '';
+    if (typeof args['text-file'] === 'string') {
+      const p = path.resolve(args['text-file']);
+      if (!fs.existsSync(p)) return { ok: false, error: 'text-file-not-found', file: p };
+      text = fs.readFileSync(p, 'utf8');
+    }
+    if (!text) return { ok: false, error: 'usage: image start --text <提示词> | --text-file <路径>' };
+    const max = Number(args.max || BINDING.keys.imageMaxInFlight || DEFAULT_MAX_IN_FLIGHT);
+    const active = inFlight(store);
+    if (active.length >= max) {
+      return {
+        ok: false, error: 'IMAGE_LIMIT_REACHED',
+        inFlight: active.length, max,
+        hint: `同时在途上限 ${max}。在途 = 还没被观测到完成的任务；跑一次 image list / wait / download 观测到出图后名额立即释放（不必等下载完）。一直被占满说明只 start 没收图。`,
+        queue: active.map((j) => ({ jobId: j.jobId, conversationId: j.conversationId })),
+      };
+    }
+    const browser = await connect();
+    let lockHeld = false;
+    try {
+      const l = acquireLock(`image-start`);
+      if (!l.ok) {
+        return {
+          ok: false, status: 'busy',
+          error: `另一个任务正占用浏览器：${l.holder.job} (pid ${l.holder.pid})`,
+          hint: '生图 send 需要独占标签页，串行等待即可（生成在服务端并行，不耽误在途任务）',
+        };
+      }
+      lockHeld = true;
+      const page = await getPage(browser);
+      await openNewChat(page);                        // 新会话（不是新标签页）
+      if (!(await isLoggedIn(page))) return { ok: false, error: 'NOT_LOGGED_IN', url: page.url() };
+      const before = await page.locator(SELECTORS.assistant).count();
+      const filled = await fillComposer(page, text);
+      if (!filled.ok) return { ok: false, ...filled };
+      await sleep(300);
+      const send = await submitComposer(page);
+      if (!send.submitted) {
+        return { ok: false, error: 'not-submitted', attempts: send.attempts, pendingText: await composerText(page) };
+      }
+      // 等 URL 定型：新会话先给临时 /c/WEB:<uuid>，实测生图场景约 15s 后换成正式 UUID
+      let ids = convIds(page.url());
+      for (let i = 0; i < 75 && ids.temporary; i++) { await sleep(400); ids = convIds(page.url()); }
+      const job = {
+        jobId: newJobId(), conversationId: ids.conversationId, url: page.url(),
+        promptChars: text.length,
+        promptFile: typeof args['text-file'] === 'string' ? path.resolve(args['text-file']) : null,
+        baselineAssistant: before, createdAt: new Date().toISOString(), state: 'generating',
+        stable: !ids.temporary,
+      };
+      store.jobs.push(job);
+      saveJobs(store);
+      return {
+        ok: true, jobId: job.jobId, conversationId: job.conversationId, url: job.url,
+        urlStable: job.stable, attempts: send.attempts,
+        inFlight: inFlight(store).length, max,
+        nextAction: '可以立刻 image start 开下一个新会话生下一张；之后用 image list / image download --job <id> 收图',
+      };
+    } finally {
+      if (lockHeld) releaseLock();
+      await browser.close().catch(() => {});
+    }
+  }
+
+  if (sub === 'list') {
+    const browser = await connect();
+    try {
+      const page = await getPage(browser, { create: false });
+      return { ok: true, count: store.jobs.length, inFlight: inFlight(store).length, jobs: await listView(page) };
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  }
+
+  if (sub === 'wait') {
+    const jobIds = args.job ? [args.job] : (args.all ? store.jobs.map((j) => j.jobId) : []);
+    if (!jobIds.length) return { ok: false, error: 'usage: image wait --job <id> | --all' };
+    const timeoutMs = Number(args.timeout || 600) * 1000;
+    const browser = await connect();
+    try {
+      const page = await getPage(browser, { create: false });
+      const results = [];
+      for (const id of jobIds) {
+        const job = findJob(store, id);
+        if (!job) { results.push({ jobId: id, state: 'not-found' }); continue; }
+        const deadline = Date.now() + timeoutMs;
+        let st = { state: 'generating' };
+        while (Date.now() < deadline) {
+          st = await jobStatus(page, job);
+          if (st.state !== 'generating' && st.state !== 'unknown') break;
+          await sleep(5000);
+        }
+        if (st.state === 'ready') { job.state = 'ready'; job.readyAt = new Date().toISOString(); job.images = st.images; }
+        results.push({ jobId: job.jobId, conversationId: job.conversationId, url: job.url, ...st });
+      }
+      saveJobs(store);
+      return { ok: results.every((r) => r.state === 'ready'), jobs: results };
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  }
+
+  if (sub === 'download') {
+    const jobIds = args.job ? [args.job] : (args.all ? store.jobs.map((j) => j.jobId) : []);
+    if (!jobIds.length) return { ok: false, error: 'usage: image download --job <id> | --all [--out <目录>] [--mode api|dom|native|auto]' };
+    const mode = String(args.mode || 'api').toLowerCase();
+    if (!['api', 'dom', 'native', 'auto'].includes(mode)) {
+      return { ok: false, error: 'CONFIG_ERROR', hint: '--mode 只支持 api | dom | native | auto（默认 api）', mode };
+    }
+    const allowUi = args['allow-ui'] === true;
+    const needsUi = mode === 'dom' || mode === 'native';
+    if (needsUi && !allowUi) {
+      return {
+        ok: false, error: 'FOREGROUND_REQUIRED', mode,
+        hint: `${mode} 模式需要把标签页切到前台（会抢用户焦点/滚动；后台标签页里图片根本不渲染），`
+          + '必须显式加 --allow-ui。无人值守请用默认 --mode api。',
+      };
+    }
+    const browser = await connect();
+    let lockHeld = false;
+    try {
+      if (needsUi) {
+        const l = acquireLock(`image-download-${mode}`);
+        if (!l.ok) {
+          return {
+            ok: false, status: 'busy', error: `另一个任务正占用浏览器：${l.holder.job} (pid ${l.holder.pid})`,
+            hint: 'UI 路径要独占窗口，串行等待',
+          };
+        }
+        lockHeld = true;
+      }
+      const page = await getPage(browser, { create: false });
+      const results = [];
+      for (const id of jobIds) {
+        const job = findJob(store, id);
+        if (!job) { results.push({ jobId: id, ok: false, error: 'IMAGE_JOB_NOT_FOUND' }); continue; }
+        let st = await jobStatus(page, job);
+        if (st.state === 'generating' && args['no-wait'] !== true) {
+          const deadline = Date.now() + Number(args.timeout || 600) * 1000;
+          while (Date.now() < deadline && st.state === 'generating') { await sleep(5000); st = await jobStatus(page, job); }
+        }
+        if (st.state !== 'ready') {
+          results.push({
+            jobId: job.jobId, conversationId: job.conversationId, ok: false, mode,
+            state: st.state, error: st.error || (st.state === 'generating' ? 'IMAGE_ASSET_NOT_FOUND' : null),
+            lastText: st.lastText || null,
+          });
+          if (st.state === 'failed' || st.state === 'text_only') job.state = st.state;
+          continue;
+        }
+        let usedMode = mode === 'auto' ? 'api' : mode;
+        let dl = usedMode === 'dom' ? await downloadAssetsViaDom(page, job, st.assets, outDir)
+          : usedMode === 'native' ? await downloadAssetsViaNative(page, job, st.assets, outDir)
+            : await downloadAssets(page, job, st.assets, outDir);
+        // auto：API 一张都没拿到、且用户显式允许抢前台 → 退到 DOM 路径（不会静默走 native 点击）
+        if (mode === 'auto' && dl.saved.length === 0 && allowUi) {
+          usedMode = 'dom';
+          dl = await downloadAssetsViaDom(page, job, st.assets, outDir);
+        }
+        if (dl.saved.length) {
+          job.state = 'downloaded';
+          job.downloadedAt = new Date().toISOString();
+          job.files = dl.saved.map((s) => s.file);
+          job.dir = dl.jobDir;
+        }
+        results.push({
+          jobId: job.jobId, conversationId: job.conversationId, url: job.url,
+          mode: usedMode, ok: dl.saved.length > 0,
+          images: dl.saved.length, dir: dl.jobDir, files: dl.saved,
+          errors: dl.errors, manifest: dl.manifest,
+        });
+      }
+      saveJobs(store);
+      return {
+        ok: results.every((r) => r.ok), outDir, mode, jobs: results,
+        inFlight: inFlight(store).length,
+        hint: results.some((r) => !r.ok)
+          ? '未下载成功的任务看各自 state/error；NATIVE_ACTION_UNAVAILABLE 表示当前 UI 没有图片下载按钮（用 api/dom）'
+          : null,
+      };
+    } finally {
+      if (lockHeld) releaseLock();
+      await browser.close().catch(() => {});
+    }
+  }
+
+  if (sub === 'run') {
+    const started = await cmdImage({ ...args, _: ['start'] });
+    if (!started.ok) return started;
+    const waited = await cmdImage({ ...args, _: ['wait'], job: started.jobId, all: false });
+    if (!waited.ok) return { ...waited, jobId: started.jobId, started };
+    const got = await cmdImage({ ...args, _: ['download'], job: started.jobId, all: false });
+    return { ...got, jobId: started.jobId, conversationId: started.conversationId, url: started.url };
+  }
+
+  return {
+    ok: false,
+    error: 'usage: image <start|list|wait|download|run> [...]',
+    help: [
+      'image start --text "<提示词>" [--max 10]   开一个新会话发提示词，URL 定型后立即返回（不等生成）',
+      'image list                                 列出任务与状态（ready / generating / text_only / failed）',
+      'image wait --job <id> [--timeout 600]      等某个任务出图',
+      'image download --job <id> [--out <目录>]   按会话 id 把图下载到本地（一张图一个文件）',
+      'image download --all                       下载所有已出图的任务',
+      'image run --text "<提示词>"                 单张图一条龙：start → wait → download',
+    ],
+  };
+}
+
 const CMDS = { launch: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
   new: cmdNew, project: cmdProject, send: cmdSend, wait: cmdWait, read: cmdRead,
-  model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor };
+  model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
+  init: cmdInit, config: cmdConfig, image: cmdImage };
 
 const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
 
   doctor                       新机器预检：能否用 / 缺什么 / 下一步做什么（先跑这个）
-  launch                       启动/复用自动化 Chrome（CDP ${CDP_URL}）
-  status                       连接状态 + 登录态 + 当前会话 id
+  init [--browser <exe>] [--user-data-dir <dir>] [--profile-directory <名>]
+                               机器级绑定（本机专属，不进 git）：用哪个浏览器 + 哪个已登录 GPT 的 profile
+                               不带参数 = 只探测（列出本机浏览器 / 正在运行的 profile / 哪个 profile 有 chatgpt cookie）
+                               已有绑定且不同时不会自动覆盖，要改加 --force；--dry-run 只预览
+  config                       只读展示当前绑定：实际用哪个浏览器/profile、各自来自哪里
+  image start --text "..." [--max 10]
+                               生图：一个任务 = 一个 GPT 新会话（"窗口"）。发完提示词、等 URL 定型就返回
+                               （不等生成），可立刻开下一个新会话；同时最多 10 张在途（下载后空位释放）
+  image list                   列出所有生图任务与状态（ready / generating / text_only / failed）
+  image wait --job <id>        等某个任务出图
+  image download --job <id> [--out <目录>] [--mode api|dom|native|auto] [--allow-ui]
+                               按会话 id 把图下载到本地文件夹（一张图一个文件 + images.json）
+                               默认 --mode api（不碰页面）；dom/native 要抢前台，必须加 --allow-ui
+  image download --all         下载全部已出图的任务
+  image run --text "..."       单张图一条龙：start → wait → download
+  launch                       启动/复用那个绑定的浏览器（CDP ${CDP_URL}）
+  status                       连接状态 + 登录态 + 绑定 + 当前会话 id
   tabs                         列出标签页
   goto <url>                   打开指定会话/项目 URL
   new                          新聊天
@@ -860,12 +1245,18 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   --request-id X  幂等键：同一 id 重复 send 不会重复发送
   --max-chars N   read 返回上限（默认 4000，原文更长时截断并给出 readRatio）
   --save          落盘图片（写到 CHATGPT_OUT_DIR）
-环境：
-  CHATGPT_AGENT     实例名（如 trae）→ profile/端口/锁全部隔离，多 agent 可并行
-  CHATGPT_CHROME    指定浏览器可执行文件（默认按平台自动探测）
-  CHATGPT_CDP_PORT  覆盖端口
-  CHATGPT_PROFILE   覆盖 profile 目录
-  CHATGPT_OUT_DIR   产物落盘目录`;
+环境（优先级：环境变量 > ~/.chatgpt-web/config.json > <skill>/.env.agent > 默认值）：
+  CHATGPT_AGENT       实例名（如 trae）→ profile 目录名/端口/锁全部隔离，多 agent 可并行
+  CHATGPT_CHROME      浏览器可执行文件；不设时按平台探测（也可以写进 config.json 的 browserPath）
+  CHATGPT_PROFILE     **已经登录过 GPT** 的 user-data-dir（写进 config.json 的 userDataDir 更持久）
+  CHATGPT_PROFILE_DIRECTORY  user-data-dir 里的 profile 名（Default / Profile 1 …）
+  CHATGPT_CDP_PORT    覆盖端口
+  CHATGPT_CONFIG      覆盖 config.json 路径
+  CHATGPT_OUT_DIR     产物落盘目录
+
+绑定命令：chatgpt-web init            # 探测本机可用的浏览器与已登录 profile，给出建议命令
+          chatgpt-web init --browser "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" \\
+                           --user-data-dir "D:\\ChromeProfiles\\GPT"`;
 
 async function main() {
   const argv = process.argv.slice(2);

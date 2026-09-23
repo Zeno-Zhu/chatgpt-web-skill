@@ -3,8 +3,14 @@ import { chromium } from 'playwright-core';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import { resolveBinding } from './config.mjs';
+import { scanBrowserProcesses, findCdpInstance, findProfileUser, samePath } from './procs.mjs';
+import { SELECTORS } from './compose.mjs';
+
+export { SELECTORS };
 
 // ---------- 环境解析（跨平台）----------
 // 实例作用域：不同 agent 想互不干扰时，各自设 CHATGPT_AGENT=trae 等，
@@ -16,45 +22,89 @@ function hashPort(s) {
   return h;
 }
 
-export const AGENT = process.env.CHATGPT_AGENT || 'default';
+// 机器级绑定：用哪个浏览器 + 哪个**已登录**的 profile。
+// 优先级：环境变量 > ~/.chatgpt-web/config.json > <skill>/.env.agent（宿主级实例名）> 默认值。
+// 默认值刻意只给端口与 profile 目录名，不给浏览器/profile 路径 ——
+// 猜错 profile 的代价是让用户重复登录（甚至触发风控），比直接报错严重得多。
+export const SKILL_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+export const BINDING = resolveBinding({ skillDir: SKILL_DIR });
+
+export const AGENT = BINDING.keys.agent || 'default';
 const SCOPE = AGENT === 'default' ? '' : `-${AGENT}`;
 
-export const CDP_PORT = Number(process.env.CHATGPT_CDP_PORT || (9444 + hashPort(SCOPE)));
+export const CDP_PORT = Number(BINDING.keys.cdpPort || (9444 + hashPort(SCOPE)));
 export const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
-export const PROFILE = process.env.CHATGPT_PROFILE
+export const PROFILE_DIRECTORY = BINDING.keys.profileDirectory || null;export const PROFILE = BINDING.keys.userDataDir
   || path.join(os.homedir(), '.chatgpt-web', `profile${SCOPE}`);
 export const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 export const TABS_FILE = path.join(STATE_DIR, `tabs${SCOPE}.json`);
 
 // 跨平台定位 Chrome：先看显式环境变量，再按平台探测常见安装位置。
 // 返回 null 表示没找到——由上层给出可操作提示，而不是抛一个看不懂的错误。
-export function resolveChrome() {
-  const explicit = process.env.CHATGPT_CHROME;
-  if (explicit && fs.existsSync(explicit)) return explicit;
-  const candidates = {
+function winCandidates() {
+  // 注意：Windows 上 Edge 常常只装在 %ProgramFiles(x86)%，Chrome 也可能只装在 %LOCALAPPDATA%。
+  // 2026-09-20 实测：本机 Edge 只存在于 Program Files (x86)，旧版候选表因此漏判。
+  const bases = [process.env['PROGRAMFILES'], process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA]
+    .filter(Boolean);
+  const rels = [
+    'Google/Chrome/Application/chrome.exe',
+    'Google/Chrome Beta/Application/chrome.exe',
+    'Google/Chrome Dev/Application/chrome.exe',
+    'Google/Chrome SxS/Application/chrome.exe',   // Canary
+    'Chromium/Application/chrome.exe',
+    'Microsoft/Edge/Application/msedge.exe',
+    'BraveSoftware/Brave-Browser/Application/brave.exe',
+  ];
+  const out = [];
+  for (const b of bases) for (const r of rels) out.push(path.join(b, r));
+  return out;
+}
+
+function browserCandidates() {
+  return {
     darwin: [
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
       '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
       '/Applications/Chromium.app/Contents/MacOS/Chromium',
     ],
-    win32: [
-      path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google/Chrome/Application/chrome.exe'),
-      path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google/Chrome/Application/chrome.exe'),
-      path.join(process.env.LOCALAPPDATA || '', 'Google/Chrome/Application/chrome.exe'),
-      path.join(process.env.PROGRAMFILES || '', 'Microsoft/Edge/Application/msedge.exe'),
-    ],
+    win32: winCandidates(),
     linux: [
       '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
       '/usr/bin/chromium', '/usr/bin/chromium-browser',
       '/snap/bin/chromium', '/usr/bin/microsoft-edge',
     ],
   }[process.platform] || [];
-  for (const c of candidates) if (c && fs.existsSync(c)) return c;
+}
+
+export function resolveChrome() {
+  const explicit = process.env.CHATGPT_CHROME;
+  if (explicit && fs.existsSync(explicit)) return explicit;
+  for (const c of browserCandidates()) if (c && fs.existsSync(c)) return c;
   return null;
 }
 
-export const CHROME = resolveChrome() || '';
+// 本机已安装的浏览器（去重、保持优先级顺序）——给 `init` 探测用
+export function listInstalledBrowsers() {
+  const seen = new Set();
+  const out = [];
+  for (const c of browserCandidates()) {
+    if (!c) continue;
+    const k = c.toLowerCase();
+    if (seen.has(k) || !fs.existsSync(c)) continue;
+    seen.add(k);
+    out.push(c);
+  }
+  return out;
+}
+
+// 显式绑定的浏览器路径优先；它不存在时**不**偷偷换一个浏览器（那正是"打开的不是我指定的浏览器"的根因），
+// 而是交给上层报 CHROME_NOT_FOUND 并给出配置修正指引。
+export const CHROME = BINDING.keys.browserPath || resolveChrome() || '';
+export const CHROME_SOURCE = BINDING.keys.browserPath
+  ? BINDING.sources.browserPath
+  : (CHROME ? 'detected' : 'default');
+export const CHROME_MISSING = !!(BINDING.keys.browserPath && !fs.existsSync(String(BINDING.keys.browserPath)));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export { sleep };
@@ -72,30 +122,83 @@ function ping() {
 
 export async function cdpAlive() { return (await ping()) !== null; }
 
-async function waitCdp(ms = 25000) {
+async function waitCdp(ms = 25000, shouldStop = () => false) {
   const end = Date.now() + ms;
   while (Date.now() < end) {
+    if (shouldStop()) return false;
     if (await cdpAlive()) return true;
     await sleep(400);
   }
   return false;
 }
 
+// 谁在监听我们这个 CDP 端口？它的 profile 是否就是配置里绑定的那个？
+// matched: true / false / null（null = 本平台拿不到进程信息，无法验证，如实返回）
+export function checkCdpProfile(port = CDP_PORT, profile = PROFILE) {
+  const scan = scanBrowserProcesses();
+  if (!scan.supported) return { supported: false, liveProfile: null, matched: null };
+  const holder = findCdpInstance(scan.entries, port);
+  if (!holder) return { supported: true, liveProfile: null, matched: null };
+  return {
+    supported: true,
+    liveProfile: holder.userDataDir,
+    liveProfileDirectory: holder.profileDirectory,
+    pid: holder.pid ?? null,
+    matched: profile ? samePath(holder.userDataDir, profile) : null,
+  };
+}
+
 export async function launchChrome({ headless = false } = {}) {
-  if (await cdpAlive()) return { launched: false, reason: 'already-running' };
+  if (await cdpAlive()) {
+    // 已经有一个可调试实例：先确认它用的就是我们绑定的 profile，
+    // 否则会"连上别的 Chrome、读到别人的会话"——看起来成功，实际是错的。
+    const check = checkCdpProfile();
+    if (check.matched === false) {
+      return {
+        launched: false, ok: false, reason: 'profile-mismatch',
+        liveProfile: check.liveProfile, liveProfileDirectory: check.liveProfileDirectory,
+        configured: PROFILE, configuredProfileDirectory: PROFILE_DIRECTORY,
+      };
+    }
+    return { launched: false, reason: 'already-running', profileVerified: check.matched };
+  }
+
+  // 顺序很重要：浏览器缺失必须在 spawn 之前判断，
+  // 否则 spawn('') 会抛 ENOENT，把"没装浏览器"伪装成一个看不懂的系统错误。
+  if (!CHROME || CHROME_MISSING) {
+    return { launched: false, ok: false, reason: 'chrome-not-found', configured: BINDING.keys.browserPath ?? null };
+  }
+
+  // 目标 profile 正被别的 Chrome 占用、但那个实例的调试端口不是我们要的：
+  // 再启动一个 chrome.exe 只会把请求交给已有实例，永远等不到我们自己的 CDP。
+  // 此时既不杀用户浏览器，也不偷偷换 profile，如实上报让用户决定。
+  const scan = scanBrowserProcesses();
+  if (scan.supported) {
+    const holder = findProfileUser(scan.entries, PROFILE, { profileDirectory: PROFILE_DIRECTORY });
+    if (holder && holder.cdpPort !== CDP_PORT) {
+      return { launched: false, ok: false, reason: 'profile-in-use', holder };
+    }
+  }
+
   fs.mkdirSync(PROFILE, { recursive: true });
   const args = [
     `--remote-debugging-port=${CDP_PORT}`,
     `--user-data-dir=${PROFILE}`,
+    ...(PROFILE_DIRECTORY ? [`--profile-directory=${PROFILE_DIRECTORY}`] : []),
     '--no-first-run', '--no-default-browser-check',
     '--disable-features=ChromeWhatsNewUI',
     'https://chatgpt.com/',
   ];
   if (headless) args.unshift('--headless=new');
+  let spawnError = null;
   const child = spawn(CHROME, args, { detached: true, stdio: 'ignore' });
+  child.on('error', (e) => { spawnError = e; });
   child.unref();
-  const ok = await waitCdp();
-  return { launched: true, ok };
+
+  const ok = await waitCdp(25000, () => !!spawnError);
+  if (spawnError) return { launched: true, ok: false, reason: 'spawn-failed', detail: spawnError.message };
+  if (!ok) return { launched: true, ok: false, reason: 'cdp-timeout' };
+  return { launched: true, ok: true, reason: 'started', profileVerified: true };
 }
 
 export async function connect() {
@@ -114,7 +217,9 @@ export function writeTabs(obj) {
   fs.writeFileSync(TABS_FILE, JSON.stringify(obj, null, 2));
 }
 
-// 找到（或创建）ChatGPT 标签页
+// 找到（或创建）ChatGPT 标签页。生图任务与普通对话**共用**同一个标签页：
+// "一个窗口"指的是 GPT 里的一个新会话（新聊天），不是浏览器标签页；
+// 每个会话的 URL 会被记账，之后按会话 id 直接取图（见 scripts/images.mjs）。
 export async function getPage(browser, { create = true } = {}) {
   const ctx = browser.contexts()[0];
   const pages = ctx.pages().filter((p) => /chatgpt\.com/.test(p.url()));
@@ -125,40 +230,19 @@ export async function getPage(browser, { create = true } = {}) {
   return page;
 }
 
-// 选择器必须"版本无关"：ChatGPT 前端会改结构。
-// 2026-09-22 实测：新 UI 里 #prompt-textarea / textarea[name=prompt-textarea] /
-// [data-testid=send-button] **全部消失**（匹配 0 个），输入框变为 div.ProseMirror[role=textbox]，
-// 发送按钮变成 button[type=submit][aria-label="Send"]（无 testid）。
-// 因此每个元素都用"语义属性优先 + 旧版兜底"的回退链。
-export const SELECTORS = {
-  composer: [
-    '#prompt-textarea',                                  // 旧版
-    "textarea[name='prompt-textarea']",
-    'div.ProseMirror[role="textbox"]',                   // 新版
-    '[contenteditable="true"][role="textbox"]',
-    '[contenteditable="true"]',
-  ].join(', '),
-  send: [
-    "button[data-testid='send-button']",                 // 旧版
-    "button[aria-label='Send']",                         // 新版（英文）
-    "button[aria-label='发送']",
-    "button[aria-label='发送提示']",
-    "form button[type='submit']",
-  ].join(', '),
-  stop: [
-    "button[data-testid='stop-button']",
-    "button[aria-label='Stop']",
-    "button[aria-label='停止']",
-    "button[aria-label='停止回答']",
-  ].join(', '),
-  voice: "button[aria-label='启动语音功能'], button[aria-label='Start voice mode']",
-  turn: "[data-testid^='conversation-turn-']",
-  user: "[data-message-author-role='user']",
-  assistant: "[data-message-author-role='assistant']",
-  copyBtn: "button[data-testid='copy-turn-action-button'], button[aria-label='Copy']",
-  login: "button[data-testid='login-button'], a[href*='auth/login'], a[href*='/auth/login']",
-  newChat: "a[data-testid='create-new-chat-button'], a[aria-label='New chat'], a[aria-label='新聊天']",
-};
+// 注意：选择器已集中到 compose.mjs（单一事实源），本文件顶部 `export { SELECTORS }` 转出。
+// 2026-09-23 实测：ChatGPT 前端整体换血，见 compose.mjs 的 SELECTORS 与 references/chatgpt-dom.md 顶部改版记录。
+
+// 在同一个标签页里开一个**新的 GPT 会话**（新聊天），并等 composer 真正可用。
+// 新标签页/新会话在 domcontentloaded 时 composer 还没渲染，此时判定登录态会误报 NOT_LOGGED_IN（实测）。
+export async function openNewChat(page) {
+  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  for (let i = 0; i < 40; i++) {
+    if (await page.locator(SELECTORS.composer).count().catch(() => 0)) break;
+    await sleep(500);
+  }
+  return page;
+}
 
 export async function isLoggedIn(page) {
   // 判据：能拿到 composer（说明已进入可用界面）。不能只看 URL —— 新版首页未登录也会停在 /。
@@ -263,9 +347,23 @@ export async function waitForCompletion(page, {
   let stopGoneSince = 0;
   let lastError = null;
   let drift = false;
+  let evalErrors = 0;
 
   while (Date.now() < deadline) {
-    const s = await page.evaluate(PROBE, base);
+    let s;
+    try {
+      s = await page.evaluate(PROBE, base);
+    } catch (e) {
+      // 生成中途页面会导航（生图会先说临时 URL、随后换成正式 UUID，甚至整页重载），
+      // 执行上下文被销毁会让 evaluate 抛错。这**不是**失败信号：继续等，别把整次 wait 判死。
+      // 2026-09-20 实测：修之前带生图的会话直接返回 "Execution context was destroyed"。
+      evalErrors++;
+      if (evalErrors > 120) {
+        return { done: false, status: 'ui_changed', text: lastText, elapsedMs: Date.now() - start, detail: e.message.slice(0, 160) };
+      }
+      await sleep(pollMs);
+      continue;
+    }
     lastError = s.errorText;
 
     // 会话漂移检测：绝不能把另一个会话的回答当成本次结果
@@ -299,9 +397,11 @@ export async function waitForCompletion(page, {
     const idle = !s.streaming && !s.working;
 
     if (textQuiet && stopQuiet && idle) {
-      // 双采样确认：间隔 500ms 两次内容一致才落地，避免瞬时静止误判
+      // 双采样确认：间隔 500ms 两次内容一致才落地，避免瞬时静止误判。
+      // 这里同样要容忍导航（生图/长回复都可能触发重载）。
       await sleep(500);
-      const s2 = await page.evaluate(PROBE, base);
+      let s2;
+      try { s2 = await page.evaluate(PROBE, base); } catch { await sleep(pollMs); continue; }
       if (s2.text === lastText && !s2.stop) {
         const status = classify(s2, { sawStop, sawTarget, text: lastText, errorText: lastError });
         if (status) return { done: false, status, text: lastText, elapsedMs: Date.now() - start, assistantCount: s2.assistantCount };
