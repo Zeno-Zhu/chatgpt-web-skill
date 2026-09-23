@@ -219,14 +219,21 @@ async function cmdDoctor() {
 
   // 4) 登录态（核心判据）
   let loggedIn = false;
+  let loginState = 'unknown';
   let currentUrl = null;
   if (alive) {
     try {
       const r = await withPage(async (page) => ({ loggedIn: await isLoggedIn(page), url: page.url() }));
       loggedIn = !!r.loggedIn;
       currentUrl = r.url;
-      add('logged-in', loggedIn ? 'ok' : 'needs-user', loggedIn ? `已登录（${r.url}）` : '未登录',
-        loggedIn ? null : '让用户在该 Chrome 窗口登录 ChatGPT；登录一次后长期有效');
+      const explicitAuth = /auth\.openai\.com|\/auth\/login/.test(r.url);
+      loginState = loggedIn ? 'ready' : (explicitAuth ? 'auth-required' : 'inconclusive');
+      add('logged-in', loggedIn ? 'ok' : (explicitAuth ? 'needs-user' : 'unknown'),
+        loggedIn ? `已登录（${r.url}）`
+          : (explicitAuth ? `明确进入登录页（${r.url}）` : `未检测到 composer，无法确认登录态（${r.url}）`),
+        loggedIn ? null
+          : (explicitAuth ? '让用户在该 Chrome 窗口登录 ChatGPT；不要代劳'
+            : '等待页面稳定后重跑 doctor --json；仍失败时按 UI_CHANGED 检查 composer 选择器'));
     } catch (e) {
       add('logged-in', 'unknown', `无法读取页面：${e.message}`, '先修 cdp-instance');
     }
@@ -263,12 +270,16 @@ async function cmdDoctor() {
     bindingTable: describeBinding(BINDING), warnings, currentUrl,
     verdict: ready
       ? 'READY：可以直接调用网页版 GPT'
-      : (CHROME && !CHROME_MISSING ? 'NEEDS-USER-ACTION：需要用户完成一次登录' : 'NOT-READY：先解决浏览器/profile 绑定'),
+      : ((!CHROME || CHROME_MISSING) ? 'NOT-READY：先解决浏览器/profile 绑定'
+        : (loginState === 'auth-required' ? 'NEEDS-USER-ACTION：明确进入登录页'
+          : 'NOT-READY：登录检测无结论，先稳定复检或检查 UI 选择器')),
     nextAction: ready
       ? 'chatgpt-web ask --text-file <prompt> --json'
       : ((!CHROME || CHROME_MISSING)
         ? 'chatgpt-web init --browser "<chrome.exe 绝对路径>" --user-data-dir "<已登录 GPT 的 profile 目录>"'
-        : (!alive ? 'chatgpt-web launch' : '让用户在弹出的 Chrome 窗口登录 ChatGPT，然后重跑 doctor')),
+        : (!alive ? 'chatgpt-web launch'
+          : (loginState === 'auth-required' ? '让用户在该 Chrome 窗口登录 ChatGPT，然后重跑 doctor'
+            : '等待页面稳定后重跑 doctor --json；仍无 composer 时检查 UI_CHANGED/选择器漂移'))),
     blocking, steps,
   };
 }

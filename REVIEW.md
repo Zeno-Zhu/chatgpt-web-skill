@@ -145,6 +145,7 @@ ui_changed / empty_response / no_response_started / busy`。
 | 16 | 附件上传静默失败 | 页面有 3 个 file input，`.first()` 拿到的是 `accept="image/*"`，塞文件被忽略 | 收敛到 `compose.setDocumentFiles`，按 accept 精确选"通用文件输入" |
 | 17 | 附件确认永远失败 | ChatGPT 对重名附件自动改名为 `name(1).md`，精确匹配必然不中 | 用 `compose.attachmentNameRe` 按主干 + `(\d+)` 后缀匹配（与远端实现合并） |
 | 18 | 脏附件污染请求 | composer 跨运行累积附件，发送时一起带出 | 新增 `composer-has-preexisting-attachments` 拦截；用 `pendingText` 区分"自己的残留"与"真脏状态" |
+| 19 | 刚 `launch` 后 `status` 瞬时误报未登录 | `domcontentloaded` 已完成，但 React composer 尚未渲染；只有 `openNewChat` 等待，`status/doctor` 仍做瞬时检查 | 把等待收敛到 `waitForComposer`；`doctor` 区分“明确认证页”与“未检测到 composer”，后者先复检/UI 诊断，不直接要求登录；文档前移这条经验 |
 
 ### 本轮最该记住的方法论教训
 

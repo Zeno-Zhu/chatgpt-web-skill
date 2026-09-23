@@ -233,22 +233,27 @@ export async function getPage(browser, { create = true } = {}) {
 // 注意：选择器已集中到 compose.mjs（单一事实源），本文件顶部 `export { SELECTORS }` 转出。
 // 2026-09-23 实测：ChatGPT 前端整体换血，见 compose.mjs 的 SELECTORS 与 references/chatgpt-dom.md 顶部改版记录。
 
+// 等 composer 真正渲染。domcontentloaded 只代表 HTML 到达，不代表 React 界面已可用；
+// 刚 launch / 新开会话时立即判登录，会把已登录 profile 误报成 NOT_LOGGED_IN（实测）。
+export async function waitForComposer(page, { timeoutMs = 10000, pollMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (await page.locator(SELECTORS.composer).first().count().catch(() => 0)) return true;
+    if (Date.now() < deadline) await sleep(pollMs);
+  } while (Date.now() < deadline);
+  return false;
+}
+
 // 在同一个标签页里开一个**新的 GPT 会话**（新聊天），并等 composer 真正可用。
-// 新标签页/新会话在 domcontentloaded 时 composer 还没渲染，此时判定登录态会误报 NOT_LOGGED_IN（实测）。
 export async function openNewChat(page) {
   await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  for (let i = 0; i < 40; i++) {
-    if (await page.locator(SELECTORS.composer).count().catch(() => 0)) break;
-    await sleep(500);
-  }
+  await waitForComposer(page, { timeoutMs: 20000, pollMs: 500 });
   return page;
 }
 
-export async function isLoggedIn(page) {
+export async function isLoggedIn(page, options) {
   // 判据：能拿到 composer（说明已进入可用界面）。不能只看 URL —— 新版首页未登录也会停在 /。
-  if (await page.locator(SELECTORS.composer).first().count()) return true;
-  if (/auth\.openai\.com|\/auth\/login/.test(page.url())) return false;
-  return false;
+  return waitForComposer(page, options);
 }
 
 // 单次采样：所有判定都绑定在"本次新增的 assistant 消息"上，不做全页面查询。

@@ -112,13 +112,23 @@ node <skill>/scripts/chatgpt.mjs config    # 只读：现在会用哪个浏览�
 - **不要**为了省事让用户"再登录一次"：同一账号在多处重复登录容易触发风控；
   优先复用用户**已有**的登录 profile（写进 `~/.chatgpt-web/config.json`，机器专属、不进 git）。
 - 绑定是显式的：已有绑定要改必须加 `--force`；skill 不会自动改，也不会偷偷换 profile。
+- `9444` 与默认专用 profile 只是未显式配置时的实现默认值，不是登录态证据；以 `config` 的实际绑定、
+  `doctor` 完整结果和 `profileVerified` 为准，不把端口或目录名硬编码成成功判据。
 
 ### Step 1｜Preflight
 ```bash
-node <skill>/scripts/chatgpt.mjs launch
-node <skill>/scripts/chatgpt.mjs status      # 必须看到 loggedIn: true
+node <skill>/scripts/chatgpt.mjs doctor --json
+# 只有 doctor 的 nextAction 明确要求 launch 时才执行，然后重新 doctor
+node <skill>/scripts/chatgpt.mjs launch --json
+node <skill>/scripts/chatgpt.mjs doctor --json
 ```
-`loggedIn: false` → **停下**，让用户在那个被打开的 Chrome 窗口里登录，然后重试。不要自己想办法登录。
+
+**登录误判经验必须先于“让用户登录”处理**：ChatGPT 冷加载时，`domcontentloaded` 已完成但 composer
+尚未渲染；前端改版也可能让 composer 选择器短暂失效。两种情况都会让已登录 profile 瞬时返回
+`loggedIn: false`。CLI 会先等待 composer；若仍为 false，先复跑一次 `doctor` 并检查完整 JSON、当前 URL
+与登录页信号。用户明确确认已登录时，按检测器/选择器漂移处理，**不得要求重复登录**。只有稳定复检后
+明确进入 `auth.openai.com`、`/auth/login`，或返回 `NOT_LOGGED_IN` / `auth_required`，才停下交给用户登录。
+
 `profileVerified: false` → 连上的是**别的** profile（`launch` 会拒止）；`null` → 本平台无法验证，
 可继续，但必须如实转述"没能证明用的是绑定 profile"。
 

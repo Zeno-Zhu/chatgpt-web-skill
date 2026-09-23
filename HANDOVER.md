@@ -18,10 +18,18 @@ node <skill>/scripts/chatgpt.mjs <命令>
 
 1. **不要自己写 Playwright/Puppeteer、不要连 CDP 端口、不要读 cookie。**
    浏览器实现全部封在 CLI 里；你自己接会抢页面、破坏完成判定。
-2. **不要自己 `launch`。** 本机通常已有实例在跑，`doctor` 会告诉你能否直接用。
-   同一台机器上**一个已登录 profile 只能有一个可调试实例**——多开必然冲突。
+2. **不要无条件 `launch`。** 本机通常已有实例在跑；只有 `doctor.nextAction` 明确要求时才调用 CLI 的
+   `launch`，随后重新 `doctor`。同一台机器上**一个已登录 profile 只能有一个可调试实例**。
 3. **每次委托前先 `doctor`**：`ready: true` 才继续；否则按它给的 `nextAction` 办，
    涉及登录/授权/OAuth 的**停下来交给用户**，不要代劳。
+
+### 已登录却误报未登录：先复检，不要让用户重复登录
+
+刚启动或刚导航时，HTML 可能已经加载，但 composer 仍在渲染；前端改版也可能让选择器漂移。
+这两种情况都会让已登录 profile 瞬时出现 `loggedIn: false`。CLI 会先等待 composer；若仍为 false，
+先复跑一次 `doctor --json` 并检查完整结果与当前 URL。用户明确确认已登录时，按检测器/UI 漂移处理。
+只有稳定复检后明确进入 `auth.openai.com`、`/auth/login`，或返回 `NOT_LOGGED_IN` / `auth_required`，
+才请用户登录。
 
 ## 2｜标准流程
 
