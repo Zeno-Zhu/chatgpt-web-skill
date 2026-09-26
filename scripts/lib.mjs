@@ -186,7 +186,14 @@ export async function launchChrome({ headless = false } = {}) {
     `--user-data-dir=${PROFILE}`,
     ...(PROFILE_DIRECTORY ? [`--profile-directory=${PROFILE_DIRECTORY}`] : []),
     '--no-first-run', '--no-default-browser-check',
-    '--disable-features=ChromeWhatsNewUI',
+    // 2026-09-26 实测补充：ChatGPT 前端在**后台或被遮挡**的标签页里会被 Chrome 节流渲染，
+    // composer 迟迟不出现（实测 launch 后 T+0 composer=false、T+12s 才 true），
+    // 表现为间歇性 NOT_LOGGED_IN。下面几条是 Playwright/Puppeteer 默认会加的防节流参数，
+    // 手写 spawn 时必须自己带上。--disable-features 只允许一个，故与上面合并。
+    '--disable-features=ChromeWhatsNewUI,CalculateNativeWinOcclusion',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
     'https://chatgpt.com/',
   ];
   if (headless) args.unshift('--headless=new');
@@ -222,9 +229,22 @@ export function writeTabs(obj) {
 // 每个会话的 URL 会被记账，之后按会话 id 直接取图（见 scripts/images.mjs）。
 export async function getPage(browser, { create = true } = {}) {
   const ctx = browser.contexts()[0];
-  const pages = ctx.pages().filter((p) => /chatgpt\.com/.test(p.url()));
+  const match = () => ctx.pages().filter((p) => /chatgpt\.com/.test(p.url()));
+  let pages = match();
   if (pages.length) return pages[pages.length - 1];
   if (!create) return null;
+  // 2026-09-26 实测（Windows / Chrome 153）：launch 返回时页面**刚开始导航，p.url() 还是空字符串**，
+  // 上述过滤必然为空。若此刻立刻 newPage，就会在同一个 profile 里开出**第二个** chatgpt.com
+  // 页面（用户可见："每次同时打开两个 GPT 窗口"）。之后 getPage 取 pages[last] 拿到的是那个
+  // 后来的页面，操作目标漂移；两个同源页面还会互相干扰 —— 实测表现为间歇性
+  // NOT_LOGGED_IN、以及提交成功但 conversationId 恒为 null（会话根本没建立）。
+  // 所以先等已有页面把 URL 落定，等不到才新建。
+  const deadline = Date.now() + 20000;
+  do {
+    await sleep(500);
+    pages = match();
+    if (pages.length) return pages[pages.length - 1];
+  } while (Date.now() < deadline);
   const page = await ctx.newPage();
   await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
   return page;

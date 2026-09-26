@@ -496,7 +496,7 @@ async function cmdSend(args) {
     else delete t.conversationId;   // 拿不到稳定 id 就不要留一个会误报漂移的旧值
     t.sentAt = new Date().toISOString();
     // 记录未提交的草稿：既让上层看到 pendingText，也让下次 send 能识别"这是自己的残留"而不误拦
-    const pendingText = submitted ? '' : (await page.evaluate(js.composerText) || '');
+    const pendingText = submitted ? '' : (await composerText(page) || '');
     t.pendingText = pendingText;
     writeTabs(t);
     const result = {

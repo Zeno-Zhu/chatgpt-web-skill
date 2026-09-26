@@ -339,3 +339,124 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
 - 不要并发在同一会话里发多条消息（会串线）；并发请用不同会话。
 - 不要用固定 `sleep` 代替 `wait` 的完成判定。
 - 不要为了"看起来完成"而截断或改写 GPT 的回答。
+## 9｜本机环境适配（2026-09-22 实测，非上游内容）
+
+> ⚠️ 本节是在受限沙箱环境（GUI 子进程会被回收）里实测得到的适配经验。
+> **回流状态**：已提 PR → https://github.com/Zeno-Zhu/chatgpt-web-skill/pull/1 （分支 `feat/sandbox-hardening`）。
+> 合并前本节只存在于本地；重新跑 `install.mjs` 会覆盖本文件，届时按 9.5 重新追加或等合并后重装。
+
+### 9.1｜GUI 子进程会被沙箱回收 → 全链路必须压进一次工具调用
+
+实测：由 Bash / PowerShell 工具拉起的 Chrome，**在本次工具调用结束时被回收**。
+三种启动方式全部无效：bash 后台 `chrome.exe … &`、本 skill 的 `launch`、PowerShell `Start-Process`。
+下一次工具调用里 `netstat` 只剩 `TIME_WAIT`、`Get-Process chrome` 计数为 0。
+
+照此执行：
+- **不要**做"先 `launch`，下一次调用再 `status` / `send`"——中间那段时间实例已经没了。
+- 用现成 wrapper 把全链路压进**同一次** Bash 调用：
+  ```bash
+  bash <skill>/scripts/run-sandbox.sh --check                     # 只验连通性与登录态
+  bash <skill>/scripts/run-sandbox.sh --text-file "C:/path/prompt.md" [--file "C:/path/a.md"] [--out "C:/path/out"]
+  ```
+- 反证：**用户自己在资源管理器点开的 Chrome 能常驻**（不受沙箱约束）。
+  看到"浏览器起不来"先分清进程是谁起的，别据此判定本 skill 坏了。
+
+### 9.2｜`PROFILE_IN_USE_NO_CDP` 是设计出口，不是故障
+
+- 触发：绑定的 profile 被一个**不带 `--remote-debugging-port`** 的 Chrome 占着（通常是用户自己开的窗口）。
+- 原因（Chrome 硬限制）：**CDP 无法附加到已运行的 Chrome**；同一 user-data-dir 同时只能有一个可调试实例。
+- 处置：这是 **ask user** 出口——**不要**杀用户浏览器、**不要**静默换 profile。
+  请用户关掉那个窗口，或让用户自己带参启动：
+  `chrome.exe --remote-debugging-port=9444 --user-data-dir="<profile 目录>" --profile-directory=Default`
+- 判断占用者是谁：看主进程命令行有没有 `--remote-debugging-port`；没有 → 是用户的日常窗口。
+  （`Get-CimInstance Win32_Process -Filter "Name='chrome.exe'"` 看 `CommandLine`。）
+
+### 9.3｜`status` 的 `loggedIn: false` 常见误报
+
+- 判据是"composer 是否存在"（`isLoggedIn`）；新标签页在 `domcontentloaded` 时 composer 可能还没渲染。
+- 处置：**轮询等 1–3 轮**（每轮几秒）再下结论，不要一看到 false 就报"未登录"。
+- 更可靠的登录证据：`init` 探测里的 `chatgptTrace: true`
+  （指向 `<profile>/IndexedDB/https_chatgpt.com_0.indexeddb.blob`）。
+  注意 `cookiesLocked: true`（Chrome 127+ app-bound 加密）时 cookie 检查不可用，此时以 trace 为准。
+
+### 9.4｜给 Windows 程序传路径必须用 `C:/` 形式
+
+Git Bash 的 `/c/Users/…` 交给 node 会被解析成 `C:\c\Users\…`。实测中招两处：
+- `node /c/…/x.mjs` → `Cannot find module 'C:\c\Users\…'`
+- `CHATGPT_OUT_DIR=/c/Users/…` → 产物（`read --md` 的 markdown、截图）**静默**落到 `C:\c\Users\…`，
+  真正的任务目录里空空如也，且 `read` 返回的 `savedMarkdown` 也是那个坏路径。
+
+规矩：`--text-file` / `--file` / `CHATGPT_OUT_DIR` 一律用 `C:/…`（`run-sandbox.sh` 已内置自动转换）。
+误建目录清理：先把文件挪走，再逐层 `rmdir`（只删空目录，天然安全），**别用 `rm -rf`**。
+
+### 9.5｜回流状态（2026-09-22）
+
+已提 PR：https://github.com/Zeno-Zhu/chatgpt-web-skill/pull/1 （`feat/sandbox-hardening` → `main`）
+
+- `SKILL.md` 增第 9 节「受限环境适配」+ `scripts/run-sandbox.sh`（已在 PR 里）
+- `status` / `doctor` 的登录判定已加 composer 就绪窗口（`CHATGPT_LOGIN_WAIT_MS`）
+- `read --md` / `--save` / `image --out` 落盘前已加盘符绝对路径校验（`PATH_NOT_DRIVE_ABSOLUTE`）
+
+**PR 合并并重新安装后，本节与 9.1–9.4 都以上游版本为准**，本文件的本地补丁即可丢弃。
+
+### 9.6｜PROFILE_IN_USE_NO_CDP 的实测诊断路径（2026-09-25，WorkBuddy 沙箱）
+
+症状：`run-sandbox.sh` 整体被 SIGTERM、零输出、零产物；`launch` 单测返回
+`CDP_TIMEOUT`（进程起来了但 9444 没开）。
+
+定位顺序（每步都把输出**落文件再 Read**，别信工具回显）：
+1. `node scripts/chatgpt.mjs status` —— 能出 JSON 说明 node/脚本/配置都正常；
+2. `node scripts/chatgpt.mjs launch` —— 报 CDP_TIMEOUT 而不是 PROFILE_IN_USE 时，
+   别急着判沙箱，先查进程；
+3. **PowerShell 工具**导出进程命令行到文件（bash 里直接调 powershell.exe 会被
+   安全层拦截，必须走 PowerShell 工具 + `Out-File`）：
+   `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -like "*<profile 目录>*" }`
+4. 判定：同 profile 的进程存在且无 `--remote-debugging-port` → 占用实锤，走 ask-user；
+   进程数为 0 → 重跑全链路。
+
+修复实例：关闭占用窗口后，`run-sandbox.sh` 全链路一次通过（launch 第 1 次、
+loggedIn 第 1 轮、send/wait/read 全 success）。**skill 更新（选择器适配 + 冷加载
+登录判定修复，上游 3cd173a）与占用修复是两件事，都要做。**
+
+另：WorkBuddy 沙箱会把 `npm install` 期间 esbuild postinstall 的 spawnSync 杀成
+EBUSY —— 重跑一次 `npm install`（或换出沙箱执行）即可，装完校验
+`node node_modules/esbuild/bin/esbuild --version`。
+
+### 9.7｜当前绑定与运行前提（2026-09-26 配置）
+
+本机绑定已切到 **skill 专用 profile**：
+
+| 项 | 值 |
+|---|---|
+| 绑定文件 | `C:\Users\Administrator\.chatgpt-web\config.json` |
+| userDataDir | `C:\ChromeProfiles\Google2`（专用，非用户日常浏览器） |
+| profileDirectory | `Default` · CDP `http://127.0.0.1:9444` |
+| 旧绑定（已弃用） | `C:\ChromeProfiles\Google1` → 备份 `config.json.bak-Google1-20260926` |
+
+> **权威副本见 `C:\Users\Administrator\.chatgpt-web\BINDING.md`**
+> （本节会被 `install.mjs` 覆盖，那份不会）
+
+三条要点：
+
+1. **绑定只有一份**：`~/.chatgpt-web/config.json` 由所有宿主共用，改它两侧同时生效，
+   不存在"workbuddy 一份、dsh 一份要同步"。实测两侧 `config` 都返回 Google2，`source: config`。
+2. **启动必须带 `--remote-debugging-port=9444`**。`chrome.exe --user-data-dir="C:\ChromeProfiles\Google2"`
+   这种不带端口的命令 skill **连不上**（运行中的 Chrome 无法事后开 CDP → `PROFILE_IN_USE_NO_CDP`）。
+   一键脚本：`C:\Users\Administrator\.chatgpt-web\start-chrome-google2.cmd`
+3. **沙箱回收已复现（2026-09-26）**：`launch` 返回 `launched: true` / `profileVerified: true`，
+   但**下一次工具调用**里 chrome 进程数 = 0、9444 只剩 `TIME_WAIT`。所以
+   **登录这类持久动作必须由用户自己启动 Chrome 完成**；用户启动的实例可常驻，
+   之后 `launch` 会检测到 9444 已有实例且 profile 匹配 → 直接复用，不重启。
+
+**本机已对 skill 代码打过补丁（2026-09-26，详见 `~/.chatgpt-web/BINDING.md` 第 8 节）**：
+
+| 文件 | 补丁 | 不修的后果 |
+|---|---|---|
+| `scripts/lib.mjs` `getPage()` | 无匹配页面时**先轮询等待 ≤20s**，再决定是否 `newPage()` | 开出**第二个** GPT 页面（用户可见"每次同时开两个窗口"）→ 操作目标漂移 → 间歇性 `NOT_LOGGED_IN`、提交成功但会话不建立 |
+| `scripts/lib.mjs` `launchChrome()` | 补防后台节流参数（`--disable-background-timer-throttling` 等），`--disable-features` 合并为一条 | 被遮挡/后台的标签页渲染被节流，composer 迟迟不出现 → 误报未登录 |
+| `scripts/chatgpt.mjs:499` | `js.composerText` → `composerText(page)` | 该行**只在提交失败时执行**，原写法抛 `js is not defined`，把真实失败原因顶掉 |
+
+⚠️ 补丁打在**源副本**（本目录），dsh 侧是从这里同步过去的。
+若将来从上游重新拉取/覆盖本目录，这 3 处补丁会丢失，需按 BINDING.md 第 8 节重新打。
+（可考虑向上游提 PR 回流。）
+
