@@ -389,15 +389,17 @@ Git Bash 的 `/c/Users/…` 交给 node 会被解析成 `C:\c\Users\…`。实�
 规矩：`--text-file` / `--file` / `CHATGPT_OUT_DIR` 一律用 `C:/…`（`run-sandbox.sh` 已内置自动转换）。
 误建目录清理：先把文件挪走，再逐层 `rmdir`（只删空目录，天然安全），**别用 `rm -rf`**。
 
-### 9.5｜回流状态（2026-09-22）
+### 9.5｜回流状态（2026-09-22 提出，2026-09-27 已闭环）
 
-已提 PR：https://github.com/Zeno-Zhu/chatgpt-web-skill/pull/1 （`feat/sandbox-hardening` → `main`）
+原 PR：https://github.com/Zeno-Zhu/chatgpt-web-skill/pull/1 （`feat/sandbox-hardening` → `main`）。
+PR 分支落后于 main 后被关闭（2026-09-27），**全部内容已改由两次直接提交合入 main**：
 
-- `SKILL.md` 增第 9 节「受限环境适配」+ `scripts/run-sandbox.sh`（已在 PR 里）
-- `status` / `doctor` 的登录判定已加 composer 就绪窗口（`CHATGPT_LOGIN_WAIT_MS`）
-- `read --md` / `--save` / `image --out` 落盘前已加盘符绝对路径校验（`PATH_NOT_DRIVE_ABSOLUTE`）
+- `fd2b18f`：3 处"会话不建立"缺陷修复（getPage 时序 / launchChrome 防节流 / `js is not defined`）+ 第 9 节 + `scripts/run-sandbox.sh`
+- 后续提交：PR 分支里 main 缺失的两项也补齐——
+  - `status` / `doctor` 的登录判定加 composer 就绪窗口（`CHATGPT_LOGIN_WAIT_MS`，见 lib.mjs isLoggedIn）
+  - Git Bash 路径套件：`normalizeUserPath`（parseArgs 的 --file/--text-file/--out 纠正 + import 期纠正 `CHATGPT_OUT_DIR`）、`requireDriveAbsolute`（`read --md` / `--save` / `image --out` 落盘校验）
 
-**PR 合并并重新安装后，本节与 9.1–9.4 都以上游版本为准**，本文件的本地补丁即可丢弃。
+**本节与 9.1–9.4 已是上游 main 的正式内容**，不再有独立的本地补丁副本。
 
 ### 9.6｜PROFILE_IN_USE_NO_CDP 的实测诊断路径（2026-09-25，WorkBuddy 沙箱）
 
