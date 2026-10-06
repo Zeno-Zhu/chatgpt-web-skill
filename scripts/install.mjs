@@ -60,7 +60,7 @@ function hostRoots() {
   ];
 }
 
-const FILES = ['SKILL.md', 'COORDINATION.md', 'THINKING.md', 'README.md', 'REVIEW.md', 'package.json', 'package-lock.json'];
+const FILES = ['SKILL.md', 'INIT.md', 'HANDOVER.md', 'COORDINATION.md', 'THINKING.md', 'README.md', 'REVIEW.md', 'package.json', 'package-lock.json'];
 const DIRS = ['scripts', 'references'];
 
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();

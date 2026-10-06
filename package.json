@@ -8,6 +8,8 @@
   "bin": { "chatgpt-web": "scripts/chatgpt.mjs" },
   "files": [
     "SKILL.md",
+    "INIT.md",
+    "HANDOVER.md",
     "COORDINATION.md",
     "THINKING.md",
     "README.md",

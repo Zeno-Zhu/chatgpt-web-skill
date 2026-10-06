@@ -41,7 +41,7 @@ declare -a HOSTS=(
   "workbuddy:$HOME/.workbuddy/skills"
 )
 
-FILES=(SKILL.md COORDINATION.md THINKING.md README.md REVIEW.md package.json package-lock.json)
+FILES=(SKILL.md INIT.md HANDOVER.md COORDINATION.md THINKING.md README.md REVIEW.md package.json package-lock.json)
 DIRS=(scripts references)
 
 run() {
