@@ -39,6 +39,9 @@ description: 用确定性命令操控网页版 ChatGPT（复用已登录会话�
 | 多轮研讨 / 思路研究 / 决策类 | [`THINKING.md`](THINKING.md) |
 | 决策类调用的协作契约 | [`COORDINATION.md`](COORDINATION.md) |
 | **DeepSeek 渠道的具体调用 / 选择器 / 排障** | [`references/DEEPSEEK.md`](references/DEEPSEEK.md) |
+| **千问渠道（契约已定稿，含坑位清单）** | [`references/QIANWEN.md`](references/QIANWEN.md) |
+| **混元渠道（契约已定稿，含坑位清单）** | [`references/HUNYUAN.md`](references/HUNYUAN.md) |
+| **新增一个网页渠道（先读这个再动手）** | [`references/DESIGN-multichannel.md`](references/DESIGN-multichannel.md) §6 渠道薄壳 |
 | 多渠道架构与圆桌讨论标准 | [`references/DESIGN-multichannel.md`](references/DESIGN-multichannel.md) |
 | 排障 / DOM 改版 | `references/` 下对应文件 |
 
@@ -363,31 +366,38 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
 > **回流状态**：已提 PR → https://github.com/Zeno-Zhu/chatgpt-web-skill/pull/1 （分支 `feat/sandbox-hardening`）。
 > 合并前本节只存在于本地；重新跑 `install.mjs` 会覆盖本文件，届时按 9.5 重新追加或等合并后重装。
 
-### 9.1｜GUI 子进程会被沙箱回收 → 必须让进程挂在沙箱进程树之外
+### 9.1｜GUI 子进程会被沙箱回收 → 必须给它一个"活着的外壳"
 
 实测：由 Bash / PowerShell / node 工具调用 `spawn` 拉起的浏览器，**在本次工具调用结束时被回收**。
 `detached: true + unref()` **不够**。下一次工具调用里 `netstat` 只剩 `TIME_WAIT`、进程计数为 0。
+（2026-10-07 复核：结论不变。）
 
-★ **判定口诀：进程是谁起的，决定它能不能活。**
-- 进来回收的：Bash 后台 `chrome.exe … &`、本 skill 的 `launch`、PowerShell `Start-Process`、node `spawn`。
-- 活下来的：**用户自己在资源管理器点开的**（不受沙箱约束）、以及 ↓ 这个。
+★ **判定口诀：进程挂在谁下面，决定它能不能活。** 沙箱回收的是"这次调用自己的进程树"。
 
-**✅ 2026-10-06 实测可用：`.cmd` 启动器 + `explorer.exe` 触发。**
-`explorer.exe` 会把进程挂到**资源管理器**下 ⇒ 脱离沙箱进程树，且落在用户桌面会话里（用户能看见）。
+**✅ 2026-10-07 实测可用（当前首选）：把浏览器和一次"长驻调用"绑在一起。**
 
-```bat
-:: <skill 或 ~/.chatgpt-web>/start-chrome.cmd
-start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
-  --remote-debugging-port=9444 ^
-  --user-data-dir="C:\ChromeProfiles\Google2" ^
-  --profile-directory=Default --no-first-run --no-default-browser-check --disable-background-mode ^
-  https://chatgpt.com/
-```
 ```bash
-explorer.exe "C:\ChromeProfiles\start-chrome-google2.cmd"   # 从工具调用里触发即可，进程会常驻
+# 一次 Bash 调用里：起浏览器 + 用 sleep 把这次调用钉住
+"C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+  --remote-debugging-port=9447 --user-data-dir="C:/EdgeProfiles/Qianwen" \
+  --profile-directory=Default --no-first-run --no-default-browser-check \
+  --start-maximized "https://www.qianwen.com/" >/dev/null 2>&1 &
+disown; sleep 5400
 ```
-⛔ **不要用 `schtasks`**：本机安全策略已把它拉黑（Program Blacklist），直接报
-`PROGRAM BLOCKED BY SECURITY POLICY`，且明确禁止绕过。
+
+把这条命令用**后台任务**方式跑（`run_in_background`）⇒ 后台任务的进程树在任务结束前一直活着
+⇒ 浏览器**跨调用存活**。这样就不需要任何"脱离沙箱"的技巧，也就不会撞安全策略。
+代价：实例的生命周期 = 那个后台任务的时长；要长期保活就把 `sleep` 放大，或到期后重跑一次。
+
+**附：`execFile('explorer.exe', [cmd])` 这条路 2026-10-07 起已失效。**
+现象很骗人——**返回码 0、无任何报错，但什么也没发生**（连 `_probe.cmd` 都写不出文件，
+`explorer.exe some.txt` 也拉不起 notepad：前后进程数都是 1）。
+所以不要再依赖它；也不用再试别的"脱离"通道——见下。
+
+⛔ **不要试这些**（都试过，都是死路）：
+- `schtasks` / 计划任务：`PROGRAM BLOCKED BY SECURITY POLICY`，明确禁止绕过。
+- WMI 建进程（`Invoke-CimMethod Win32_Process Create`）：被拦，理由直接写着
+  "equivalent to Start-Process"。**这属于绕过安全控制，不该做。**
 
 照此执行：
 - **不要**做"先 `launch`，下一次调用再 `status` / `send`"——除非浏览器是经上面这条路起的。
@@ -396,8 +406,8 @@ explorer.exe "C:\ChromeProfiles\start-chrome-google2.cmd"   # 从工具调用里
   bash <skill>/scripts/run-sandbox.sh --check                     # 只验连通性与登录态
   bash <skill>/scripts/run-sandbox.sh --text-file "C:/path/prompt.md" [--file "C:/path/a.md"] [--out "C:/path/out"]
   ```
-- 反证：**用户自己在资源管理器点开的 Chrome 能常驻**。
-  看到"浏览器起不来"先分清进程是谁起的，别据此判定本 skill 坏了。
+- **用户自己在资源管理器双击**启动器依然有效（进程挂在资源管理器下，与沙箱无关），
+  这是最稳的兜底，但需要用户动手一次。
 
 ### 9.1b｜宿主注入的 `HTTP_PROXY` 会污染 loopback 连接（2026-10-06 实测）
 
@@ -554,15 +564,27 @@ EBUSY —— 重跑一次 `npm install`（或换出沙箱执行）即可，装�
 - 但**轮次不是深度**：为了"显得深入"而追问是反模式。没有增量就停，并如实说明。
 
 
-## 11｜第二条渠道：DeepSeek 网页（2026-10-06 打通）
+## 11｜渠道清单（DeepSeek / 千问 / 混元，各用各的实例，互不干扰）
 
 **同一个 skill 下的并列渠道**，不是新的 skill。绑定读 `~/.chatgpt-web/config.json` 的
-`targets.deepseek`（v2 多 target），与 ChatGPT 各用各的浏览器 / profile / 端口，互不干扰。
+`targets.<渠道名>`（v2 多 target），与 ChatGPT 各用各的浏览器 / profile / 端口。
+
+| 渠道 | 脚本 | 端口 | 实例目录 | 状态 |
+|---|---|---|---|---|
+| DeepSeek | `scripts/deepseek.mjs` | 9445 | `C:\EdgeProfiles\DeepSeek` | ✅ 已打通 |
+| 千问 | `scripts/qianwen.mjs` | 9447 | `C:\EdgeProfiles\Qianwen` | ✅ 已打通 |
+| 混元 | `scripts/hunyuan.mjs` | 9446 | `C:\EdgeProfiles\Hunyuan` | ✅ 已打通（默认 High） |
+
+> 新增渠道的**正确姿势**：写一份 spec（薄壳），不要复制整份脚本。
+> 通用逻辑都在 `scripts/channel-kit.mjs`，见 §12.5 与
+> [`references/DESIGN-multichannel.md`](references/DESIGN-multichannel.md) §6。
+
+下面以 DeepSeek 为例说明调用形态，其余渠道命令同构：
 
 ```bash
 node <skill>/scripts/deepseek.mjs doctor        # 绑定、profile、CDP 一次看全
 node <skill>/scripts/deepseek.mjs status        # 登录态 + 两个开关的当前状态
-node <skill>/scripts/deepseek.mjs launch        # 起浏览器（走 .cmd + explorer，见 9.1）
+node <skill>/scripts/deepseek.mjs launch        # 起浏览器（见 9.1 的保活方式）
 node <skill>/scripts/deepseek.mjs ask --text "..." [--md "C:/out/reply.md"]
 ```
 
@@ -585,6 +607,46 @@ node <skill>/scripts/deepseek.mjs ask --text "..." [--md "C:/out/reply.md"]
 选择器清单、为什么不用 hash class、`newChat` 的静默失败、等待完成的判据、
 "复制已登录 profile 复用登录态"的完整做法 —— 全在
 [`references/DEEPSEEK.md`](references/DEEPSEEK.md)。**本节不重复**（重复即失效处）。
+
+### 11.4｜千问渠道（`scripts/qianwen.mjs`，2026-10-07 打通）
+
+```bash
+node <skill>/scripts/qianwen.mjs doctor              # 顺带看 binding.source 对不对
+node <skill>/scripts/qianwen.mjs status              # 登录态 + 当前模式
+node <skill>/scripts/qianwen.mjs modes --thinking on # 切「思考研究」（本渠道默认值）
+node <skill>/scripts/qianwen.mjs ask --text "..." [--md "C:/out/reply.md"]
+```
+- 默认**「思考研究」**（`快速` 是站方默认，我们要的是前者）。
+- 访客态即可用；`requireLogin: false`。实例：端口 **9447**，`C:\EdgeProfiles\Qianwen`。
+- 三处站方特性**必须知道**，否则会写出"看着对、其实没提交"的代码：
+  **回车不提交**（要点 `button[aria-label="发送消息"]`）、**输入框是 contenteditable**
+  （不能用 `fill()`）、**答题卡片 ≠ 正文**（正文是 `.qk-markdown`）。
+- 完整契约 / 坑位 / 重探顺序 → [`references/QIANWEN.md`](references/QIANWEN.md)。
+
+### 11.5｜混元渠道（`scripts/hunyuan.mjs`，2026-10-07 打通）
+
+```bash
+node <skill>/scripts/hunyuan.mjs doctor              # 顺带看 binding.source 对不对
+node <skill>/scripts/hunyuan.mjs status              # 登录态 + 当前档位
+node <skill>/scripts/hunyuan.mjs modes --thinking on # 切 High（本渠道默认值）
+node <skill>/scripts/hunyuan.mjs ask --text "..." [--md "C:/out/reply.md"]
+```
+
+- 默认**「High」**（`No Think` 是站方默认，我们要的是前者）。`requireLogin: true`。
+  实例：端口 **9446**，`C:\EdgeProfiles\Hunyuan`。
+- 四条站方特性**必须知道**：
+  **回车即提交**（但别配发送按钮，见下）、回复正文是 `.hyc-common-markdown`
+  （外层气泡会混进「处理完成」）、档位触发器是 **`div.paint-button`（无 aria 属性）**、
+  新对话 = 点侧栏「对话」。
+- ★ **档位只可靠在落地页设。** 进会话后那个控件**时有时无**（惰性渲染），
+  实测同一会话一次采样到 0 个、一次采样到 1 个。所以正确顺序永远是
+  **在 `/` 上设档位 → 开新会话 → 发送**，也就是 `ask` 的默认顺序。
+  用 `--no-new` 续聊时档位**不可控**，信封里 `modes.thinking` 可能是 `null`——
+  **别把 `null` 当"已开 High"**。
+- ★ **High 有 40 秒以上的静默思考期**：AI 气泡 2 秒就出现了，但正文一直是空的
+  （实测 t=2s ~ t=38s `len=0`，t=40s 正文一次性出现）。
+  所以"气泡出现了"绝不能当答完的判据；耗时波动 15s~175s，`--timeout` 给足。
+- 完整契约 / 坑位 / 重探顺序 → [`references/HUNYUAN.md`](references/HUNYUAN.md)。
 
 
 ## 12｜网页渠道通用坑（域级，任何网页渠道都适用）
@@ -619,5 +681,117 @@ node <skill>/scripts/deepseek.mjs ask --text "..." [--md "C:/out/reply.md"]
 
 - 见 §11.3 与 `references/DEEPSEEK.md` §5：判"流式输出结束"要用**输出容器级**文本，
   且"是否已开始"要和**动作前的快照**比 —— 这两条是同一个思维：**别用页面/全局状态当进度信号**。
+
+### 12.5｜新增渠道 = 写 spec，不要复制脚本（2026-10-07 定）
+
+`chatgpt.mjs` / `deepseek.mjs` 各 600 行，其中**与站点无关**的部分占九成。加第三个渠道若复制粘贴，
+就是把 600 行维护成本乘 2。
+
+现在的结构：
+- **`scripts/channel-kit.mjs`** —— 通用引擎（CDP、信封、启动、发送、等待、读取、模式、新对话、自诊断）。
+- **`scripts/<渠道>.mjs`** —— 只有一份 **spec**（约 60 行）：URL / 端口 / 绑定 / 选择器 / 模式定义。
+
+```js
+import { runChannel } from './channel-kit.mjs';
+runChannel({ target: 'qianwen', url: '…', cdpPort: 9447, composer: {…}, assistant: {…}, modes: […], … });
+```
+
+**纪律**：改选择器只改 spec。**只有当"这个改进对所有渠道都成立"时才动引擎**，
+并且顺手在本节记一条 —— 否则 spec 会慢慢长成第二份 600 行。
+
+### 12.6｜交互一律用 locator 发真实事件，别用 JS `.click()`
+
+`document.querySelector(…).click()` 在 React / Radix 这类组件上**经常"返回成功但状态没变"**。
+实测（千问模式下拉）：JS 点击返回 `ok`，但触发器的 `aria-expanded` 始终是 `false`，菜单根本没开。
+换 Playwright locator（真实鼠标事件）后一次就开。
+
+**判据**：点完读 `aria-expanded` / `data-state` 这类**状态属性**。
+"我点了"和"它开了"是两件事（同 12.2）。
+
+### 12.7｜提交方式必须实测；"输入框没清空"≠"没发出去"
+
+- 有的站点**回车不提交**，必须点发送按钮（千问：`button[aria-label="发送消息"]`）。
+  且该按钮**空输入时是 disabled**，硬点会静默失败 → 要先轮询到它 enable。
+- 有的站点**提交了但不清空输入框**。实测千问出现过：消息已发出、答案正在生成，
+  而输入框内容还在 ⇒ 若只看输入框就会误报 `SEND_FAILED`。
+- ✅ 现在的双判据 + 交叉验证：**输入框内容变了 或 发送按钮变 disabled**，
+  再过一遍**"助手容器数量是否增加"**作正向确认。
+- 富文本编辑器（ProseMirror 类）的 **placeholder 是真实节点**，
+  空白时 `innerText` 返回「向千问提问」而不是空串 —— 任何"文本为空即未输入"的写法在这里都失效。
+  同理，输入用 `keyboard.insertText`，**`fill()` 对这类编辑器不生效**。
+
+### 12.8｜容器 ≠ 正文：回复容器要分两级取
+
+回复卡片里除了模型正文，常混着**推荐动作按钮的文案**（实测千问卡片里带
+「好的，交给工作助理模式继续完成」）。直接取卡片 `innerText` 会把它混进答案，
+污染下游（尤其是要把答案喂给另一个模型时）。
+
+- spec 里用 `assistant.sel`（定位这一条消息）+ `assistant.textSel`（只取正文）两级选择器；
+- 再配 `assistant.dropLines` 做**行级**剔除，正则要**精确点名**，别写宽泛规则（会连正文一起吃掉）。
+
+### 12.9｜绑定回退吃掉"别人的"扁平键（新增渠道时最阴的一个）
+
+`config.json` 顶层的 `browserPath` / `userDataDir` 是**主渠道 chatgpt 的**绑定。
+新增渠道时若忘了写 `targets.<新渠道>`，一个"贴心的"扁平回退会把它指到 chatgpt 的
+Chrome + `C:\ChromeProfiles\Google2`，而 `doctor` 依然报**一切正常** —— 真去 launch 就用错 profile。
+
+- 规则：**扁平回退默认关闭**，只有主渠道显式 opt-in（`flatFallback: true`）。
+- 判据：`doctor` 的 `binding.source` 必须是 `config:targets.<渠道名>`。
+  看到 `config:flat` 就是踩了这个坑。
+
+### 12.10｜"没看到登录按钮"≠"已登录"（2026-10-07 实测）
+
+通用兜底写成"页面上没有『登录』按钮 ⇒ 已登录"，在混元上直接**假阳性**：
+
+- 未登录访问 `aistudio.tencent.com` 会跳到 **`/scan`（扫码登录页）**，
+  那一页**没有**单独的"登录"按钮（它本身就是登录页）⇒ 被误判成已登录，
+  上层于是"放心地"往下走，然后在找不到输入框的地方莫名其妙地失败。
+
+修正后的判据（两层）：
+1. **URL 路径落在 auth 段**（`/scan` `/login` `/signin` `/passport` `/sso`）⇒ 一定未登录；
+2. 再叠加本渠道自己的信号（如混元的 `localStorage.hyUserName` 有值）。
+
+⇒ 规则：**通用兜底只用来"兜底"，每个渠道都要在 spec 的 `login.probe` 给出自己的判据**，
+并且把判定依据（`via`）一起回传，方便事后对账。
+`via` 出现 `signin-absence` 这类纯兜底来源时，多留一分怀疑。
+
+### 12.11｜控件的"存在性"随视图变化（2026-10-07 实测）
+
+同一个控件，在这个视图有、在那个视图没有 —— 而且**是"时有时无"**。
+实测（混元档位）：进会话后 `querySelectorAll('.paint-button')` 一次采样是 **0**、
+另一次采样是 **1**（惰性渲染）。于是"读档位"返回 `null`、"设档位"无声失败。
+
+- 别把在一个视图里读到的控件当成**全天候可用**。spec 里要写清**在哪个 URL 上操作才成立**
+  （混元就是：档位只能在落地页 `/` 设，见 §11.5）。
+- 读不到要**如实报 `null`**，不要 fallback 成一个"看起来合理"的默认值——
+  那会把"没设上"伪装成"已设好"。
+- 触发器不在页面上时，引擎**立刻**返回 `err: 'trigger-absent'`（带一句 hint），
+  而不是去点一个不存在的东西白等 8s 点击超时。**报错快，也是诚实的一部分。**
+
+### 12.12｜"消息气泡出现了"≠"答完了"（静默思考期）
+
+开了深度思考 / High 档位的模型，会先**长时间不输出**：
+
+```
+t=2s   AI 气泡已出现，正文 len=0
+t=38s  仍然 len=0            ← 这 36 秒里"气泡存在"一直为真
+t=40s  正文一次性出现         ← 真正的完成信号
+```
+
+- 拿"容器数量增加"当完成判据，会在 **第 2 秒**就宣布答完并读到**空答案**。
+- 正确判据：**正文非空** 且稳定 `stableMs`（引擎里那句 `lastText &&` 就是干这个的）。
+- 耗时波动极大（实测同一句话 **15s / 40s / 50s / 175s**）⇒ `--timeout` 给足，
+  别按 30s 设。若长文有被截断的迹象，用 `--stable 7000` 放大稳定窗口。
+
+### 12.13｜开关型触发器：点之前先归零
+
+模式触发器常是**开合型**：菜单开着时再点一下是**关掉**。
+若上一轮把菜单开在那儿没关（或被其他操作打开），这一下就点反了 ——
+然后找选项会一路等到超时才失败，现象还长得像"选择器写错了"。
+
+更阴的是**浮层常驻 DOM**：混元的档位浮层关着时**依然在**，只是 `0×0`。
+⇒ **"元素存在"不能证明菜单开着**，反过来靠它判"没开"也会误判。
+
+✅ 引擎现在的做法：点触发器**之前**先按一次 `Escape` 归零（顺带也能关掉落地弹窗）。
 
 

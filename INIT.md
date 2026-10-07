@@ -120,12 +120,29 @@ node <skill>/scripts/chatgpt.mjs doctor --json     # 期望 ready: true
 
 ## 4｜多台电脑 / 换渠道时的检查清单
 
+### 4.0 本机现有实例（一眼表，改渠道时照着对齐）
+
+| 渠道 | 端口 | 实例目录 | 启动器 | 登录态 |
+|---|---|---|---|---|
+| chatgpt | 9444 | `C:\ChromeProfiles\Google2` | `~/.chatgpt-web/start-chrome-google2.cmd` | 已登录 |
+| deepseek | 9445 | `C:\EdgeProfiles\DeepSeek` | `C:\EdgeProfiles\start-edge-deepseek.cmd` | 已登录 |
+| hunyuan | 9446 | `C:\EdgeProfiles\Hunyuan` | `C:\EdgeProfiles\start-edge-hunyuan.cmd` | 已登录（含 High 偏好，落盘验证过） |
+| qianwen | 9447 | `C:\EdgeProfiles\Qianwen` | `C:\EdgeProfiles\start-edge-qianwen.cmd` | 已登录（`思考研究` 为会话级，`ask` 每次重设） |
+
+> 三个 Edge 实例互不干扰，可同时活着。但**别对同一站点开两个实例**——
+> 同一份 profile 被两个进程占用会写坏 leveldb。
+
+（另有 Vidu 实例跑在 9222，属 `manju-vidu` skill，**不属于本 skill，不要动**。）
+
+### 4.1 检查清单
+
 - [ ] `init` 探测已装浏览器 → 问用户选哪个
 - [ ] **先试 A：复制用户已登录的 profile**（复制前**必须完全退出**那台浏览器）
-- [ ] A 不成立（本机没登录过）→ 走 B：专用 profile 目录已创建，浏览器能用调试端口起来
+- [ ] A 不成立 → 走 B：专用 profile 目录已创建，浏览器能用调试端口起来
 - [ ] **用户已登录目标网站**（A 成功后无需此步；B 需要用户亲自做，agent 不代劳）
-- [ ] 启动了 `.cmd` 启动器，并用 `explorer.exe` 触发（否则活不过一次工具调用）
-- [ ] `doctor` 到 `ready: true`（DeepSeek 渠道：`deepseek.mjs doctor` + `status` 里 `loggedIn: true`）
+- [ ] 新增渠道时写了 `targets.<name>`，且 `doctor` 的 `binding.source` 是 `config:targets.<name>`
+- [ ] 浏览器起来了并**跨调用存活**（保活方式见 SKILL.md §9.1；`explorer.exe` 那条路已失效）
+- [ ] `doctor` 到 `ready: true`（各渠道另有 `status` 里的 `loggedIn: true`）
 - [ ] 已写 `~/.chatgpt-web/STATE.json`（`verified: true`）
 - [ ] 之后正常开工时：**不再读本文件**
 

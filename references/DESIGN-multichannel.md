@@ -158,13 +158,62 @@ cookie 又是 app-bound 加密（无法程序化迁移）。所以：
 - 每次调用带 `--request-id`（幂等），产物落任务目录，长期状态写 state file
   （`objective` / `locked_decisions` / `open_questions` / `next_action`），**不要把聊天记录当状态库**。
 
-## 6｜落地计划
+## 6｜落地进度（2026-10-07 更新）
 
-| 步 | 内容 | 验收 |
+| 步 | 内容 | 状态 |
 |---|---|---|
-| 1 | config v2 + v1 兼容 + `state` 命令 | 老机器不用改文件；`config --json` 仍返回原绑定 |
-| 2 | 抽 `envelope.mjs`，两个 CLI 共用 | 既有命令的 `--json` 输出**逐字段不变** |
-| 3 | `providers/deepseek.mjs` + `--target deepseek` | 用户登录后 `doctor --target deepseek` → `ready: true` |
-| 4 | DeepSeek 的 new/send/wait/read | 端到端跑通，产物落盘正确 |
-| 5 | 开关（深度思考/智能搜索）默认开、可关、读回核实 | 三种组合实测 |
-| 6 | 圆桌编排（可选命令或文档化流程） | 一次真实双渠道质询，产出三张清单 |
+| 1 | config v2 + v1 兼容（顶层扁平键保留） | ✅ 现为 **v3**，新增 `targets.hunyuan` / `targets.qianwen` |
+| 2 | 信封 / 绑定 / CDP 抽成共用层 | ✅ 落在 `scripts/channel-kit.mjs`（不再是 `envelope.mjs`，范围更大） |
+| 3 | DeepSeek 渠道端到端 | ✅ 2026-10-06 打通 |
+| 4 | 千问渠道端到端 | ✅ 2026-10-07 打通（≈5s，多轮验证过） |
+| 5 | 混元渠道端到端 | ✅ 2026-10-07 打通（默认 High；档位只能在落地页设，见 §11.5） |
+| 6 | 圆桌编排（多渠道交叉质询） | ⛔ 标准已定（§5），**可执行编排尚未落地** |
+
+> 与最初设想的差异：原计划"抽 `envelope.mjs`、用 `--target` 选渠道"，
+> 实际落成**"每渠道一个薄壳脚本 + 一份 spec"**。理由见 §7：`--target` 方式会让
+> 单文件继续膨胀，而薄壳方式下新增渠道的成本是"写 60 行 spec"，不是"读 600 行"。
+
+## 7｜渠道薄壳：新增一个渠道的标准动作
+
+**目标**：把"新增渠道"的成本从"复制 600 行"降到"写一份契约"。引擎在
+`scripts/channel-kit.mjs`，渠道只提供 spec。
+
+### 7.1 六步（照做即可）
+
+1. **定实例**：`config.json` 加 `targets.<name>`（浏览器路径 / userDataDir / profileDirectory /
+   cdpPort / launcher）。**必须显式写**——见 SKILL.md §12.9 的扁平回退坑。
+2. **建启动器**：`start-<name>.cmd`（独立 user-data-dir + 调试端口）。存两份：
+   `C:\EdgeProfiles\`（给用户双击）与 `~/.chatgpt-web/`。
+3. **拉起来看页面**：先只做侦察，别急着写代码。`doctor` → `status` → `dump`，
+   必要时用临时探针把 DOM 打印出来（探针放工作区，**不要放进 skill 目录**）。
+4. **写 spec**：`scripts/<name>.mjs`，把 composer / assistant / modes / newChat / login 五组契约填上。
+   拿不准的字段**留 TODO 并写清"怎么补"**，不要猜一个值装作能用。
+5. **端到端验收**：`ask` 跑通 → 记录耗时/字数；`--no-new` 验多轮；`modes --<key> on` 验切换回读；
+   最后 `quit` → 重启 → `status`，确认**登录态真的落盘**（不验这一步，第二天可能就得重登）。
+   顺带实测清楚**每个控件在哪个视图可用**——控件的存在性会随视图变化（§12.11）。
+6. **落文档**：`references/<NAME>.md`（契约表 + 坑位 + 重探顺序）+ SKILL.md §11 表格加一行。
+
+### 7.2 引擎已经替你解决的问题（别在 spec 里重造）
+
+- **信封**：`protocol_version / ok / code / state / target / cdp_url / request_id / ts`。
+- **等待完成**：容器级文本 + **发送前基线**（整页文本、"比上次更长"两版都失败过）。
+- **点按回读**：所有交互的返回里都带 `before / after`，强制对账。
+- **自诊断**：模式菜单找不到时回 `diag.menuCount / diag.menus`，
+  区分"菜单没开"和"选项文案变了"——这两种情况的处置完全不同。
+- **触发器不存在就快报**：回 `err: 'trigger-absent'` + hint，不去点空气白等 8s（§12.11）。
+- **点开关型触发器前先 `Escape` 归零**：菜单浮层常驻 DOM，起点若已是"开着"，一点就关（§12.13）。
+- **`newChat` 的"无需动作"**：页面上 0 条助手消息时直接回 `via: 'already-fresh'`，
+  不假装点了、也不误报失败。它同时是个探针——一直走 already-fresh 说明 `assistant.sel` 可能配错了。
+- **绑定不吃"别人的"扁平键**：`targets.<name>` 优先，扁平回退默认关闭（§12.9）。
+- **`quit`**：走原始 CDP `Browser.close`，让 cookie / localStorage 落盘。
+  Playwright 的 `browser.close()` 在 `connectOverCDP` 下**只断开不关**，别拿它当收尾。
+
+### 7.3 什么时候才该改引擎
+
+判据只有一条：**这个改进对所有渠道都成立吗？**
+- 是 → 改 `channel-kit.mjs`，并在 SKILL.md §12 加一条记录。
+- 否 → 它属于 spec。
+
+反例（应留在 spec）：某项 selector、某个站点的 button 文案、某个渠道特有的 `dropLines`。
+正例（应进引擎）：提交判据的双判据+交叉验证、"交互走 locator 而非 JS click"、
+两级选择器（容器 / 正文）。
