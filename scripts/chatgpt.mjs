@@ -352,24 +352,168 @@ async function cmdNew(args) {
 }
 
 // 进入项目上下文（点击"打开项目首页"，进入项目内新聊天）
+// 项目空间（project space）
+// 2026-10-22 实测的稳定事实（新版 UI）：
+//   · 侧边栏项目行 = div[role="button"]，文本恰为项目名（旧版 div.__menu-item 已不存在）
+//   · 点行本身只是展开/收起，**不改 URL**；真正的入口是悬停后出现的
+//     button[aria-label="在 <项目名> 中开启新聊天"]（旧版是「打开项目首页」，已消失）
+//   · 项目首页 URL = /g/<g-p-id>/project；在这里发消息 → 自动长成项目内的新会话
+//     /g/<g-p-id>/c/<conversation-uuid>（这就是要记录的链接）
+//   · 项目来源（sources）行 = li[class*="project-source"]（每行 innerText = 文件名/类型/日期），
+//     一次挂载后所有会话共享，**不需要在每条消息里重传附件**，prompt 里点名文件名即可
+const RE_PROJECT_REF = /(g-p-[0-9a-f]{8,})/i;
+const RE_PROJECT_URL = /^https?:\/\//i;
+
+function escapeRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// URL 里的项目 id（项目首页 /g/<id>/project、项目内会话 /g/<id>-<slug>/c/<cid> 都认）
+// ⚠️ 项目内会话的路径段带名字 slug（实测 .../g/g-p-<hex>-hai-wai-ju-ben-1/c/<uuid>），
+// 所以 g-p-<hex> 后面必须允许一段 `-slug`，否则 projectId 永远是 null。
+function projectIdOf(url) {
+  const m = String(url || '').match(/\/g\/(g-p-[0-9a-f]+)(?:-[^/]*)?(?:\/|$)/i);
+  return m ? m[1] : null;
+}
+
+// 等项目上下文就位：URL 出现 projectId + composer 可用
+async function waitForProject(page, { timeoutMs = 20000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (projectIdOf(page.url()) && (await page.locator(SELECTORS.composer).first().count().catch(() => 0))) return true;
+    if (Date.now() < deadline) await sleep(400);
+  } while (Date.now() < deadline);
+  return false;
+}
+
+// 打开某个项目（名字 / 项目 URL / g-p-id 都接受）。返回 page，判据是 URL 里的 projectId。
+async function openProject(page, ref) {
+  const idInRef = String(ref).match(RE_PROJECT_REF);
+  if (idInRef) {
+    // 已知 id 就不绕首页：少一次往返，也没有同名项目歧义
+    await page.goto(`https://chatgpt.com/g/${idInRef[1]}/project`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await waitForProject(page);
+    return { via: RE_PROJECT_URL.test(ref) ? 'url' : 'id' };
+  }
+
+  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const name = String(ref);
+  // 侧边栏项目区是**异步渲染**的：实测 goto 后 2s 还没有行、3.5s 才出现（固定 sleep 2s 会误报 not-found）。
+  // 所以这里轮询等行出现，而不是赌一个固定时长。
+  const exact = new RegExp(`^\\s*${escapeRe(name)}\\s*$`);
+  let row = null;
+  const rowDeadline = Date.now() + 15000;
+  do {
+    // 新版：div[role="button"] 且文本恰为项目名；旧版 div.__menu-item 作兜底
+    row = page.locator('div[role="button"]', { hasText: exact }).first();
+    if (await row.count().catch(() => 0)) break;
+    row = page.locator('div.__menu-item', { hasText: name }).first();
+    if (await row.count().catch(() => 0)) break;
+    row = null;
+    if (Date.now() < rowDeadline) await sleep(400);
+  } while (Date.now() < rowDeadline);
+  if (!row) return { via: null, notFound: true };
+
+  await row.hover();
+  await sleep(700);
+  // 悬停后出现的入口按钮；aria-label 里项目名两侧有空格，故用"包含"匹配
+  let clicked = false;
+  const labels = await page.locator('button[aria-label]').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+  const hit = labels.find((l) => l && l.includes('中开启新聊天') && l.includes(name))
+    || labels.find((l) => l && l.includes('打开项目首页'));
+  if (hit) {
+    await page.locator(`button[aria-label="${hit}"]`).first().click({ force: true }).catch(() => {});
+    clicked = true;
+  }
+  if (!clicked) await row.click();   // 兜底：点行本身（多数情况只展开，靠后面的 URL 判据兜住）
+  await waitForProject(page);
+  return { via: hit ? (hit.includes('中开启新聊天') ? 'new-chat-in-project' : 'project-home') : 'row-click', entryLabel: hit || null };
+}
+
 async function cmdProject(args) {
-  const name = args._[0] || args.name;
-  if (!name) return { ok: false, error: 'usage: project <项目名>' };
+  const ref = args._[0] || args.name;
+  if (!ref) return { ok: false, error: 'usage: project <项目名|项目URL|g-p-id>' };
   return withPage(async (page) => {
-    await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await sleep(2000);
-    const row = page.locator('div.__menu-item', { hasText: name }).first();
-    if (!(await row.count())) return { ok: false, error: 'project-not-found', name };
-    await row.hover();
-    await sleep(600);
-    const openBtn = page.locator('button[aria-label="打开项目首页"]').first();
-    if (await openBtn.count()) { await openBtn.click({ force: true }); }
-    else { await row.click(); }
-    await sleep(3500);
-    // 项目上下文的可靠判据是 URL 里的 projectId；aria-label 只作辅助信号（新版 UI 可能是 "Ask ChatGPT"）
+    const r = await openProject(page, ref);
+    if (r.notFound) return { ok: false, error: 'project-not-found', name: String(ref) };
+    // 项目上下文的可靠判据是 URL 里的 projectId；placeholder 只作辅助信号
     const ph = await page.locator(SELECTORS.composer).first().getAttribute('aria-label').catch(() => null);
-    const ids = convIds(page.url());
-    return { ok: true, url: page.url(), placeholder: ph, inProject: !!ids.projectId, ...ids };
+    const projectId = projectIdOf(page.url());
+    if (!projectId) {
+      return {
+        ok: false, error: 'not-in-project', url: page.url(), via: r.via,
+        hint: 'URL 里没有 projectId：说明没进项目（可能只是展开了侧边栏）。可直接传项目 URL 或 g-p-id 跳过点击',
+      };
+    }
+    return {
+      ok: true, url: page.url(), projectUrl: `https://chatgpt.com/g/${projectId}/project`,
+      placeholder: ph, inProject: true, projectId, via: r.via,
+      nextHints: ['sources 列出项目已挂载的来源（无需重复上传）', 'send 在此上下文发消息 → 自动在项目内新建会话'],
+    };
+  });
+}
+
+// 读取当前项目页里的来源清单。返回 [{name, type, date}]
+async function readProjectSources(page) {
+  // 行本身是 li.group/project-source（2026-10-22 实测）。
+  // ⚠️ 别用 div[class*="project-source"]：那个前缀会命中**子元素**（日期/操作区），
+  // 它们的 innerText 是空串 —— 结果是"计数 20、解析出 0 条"这种最容易骗人的假成功。
+  let rows = page.locator('li[class*="project-source"]');
+  if (!(await rows.count().catch(() => 0))) {
+    // 兜底：换成任意标签，但只认内部文本里有文件扩展名的（排除装饰性兄弟元素）
+    rows = page.locator('[class*="project-source"]').filter({ hasText: /\.(md|docx?|pdf|txt|xlsx|pptx|csv|json)\b/i });
+  }
+  const n = await rows.count();
+  if (process.env.CHATGPT_DEBUG) process.stderr.write(`[sources:debug] url=${page.url()} rows=${n}\n`);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const txt = (await rows.nth(i).innerText().catch(() => '')) || '';
+    const lines = txt.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    const date = lines.find((l) => /\d+\s*月\s*\d+\s*日|^\d{4}-\d{1,2}-\d{1,2}$/.test(l)) || null;
+    const type = lines.find((l) => l !== lines[0] && l !== date && l.length <= 6) || null;
+    out.push({ name: lines[0], type, date });
+  }
+  return out;
+}
+
+// sources [项目名|URL]：列出项目里**已经挂着**的来源，让调用方不必重复上传附件
+async function cmdSources(args) {
+  const ref = args._[0] || args.name || null;
+  return withPage(async (page) => {
+    let via = 'current-page';
+    if (ref) {
+      const r = await openProject(page, ref);
+      if (r.notFound) return { ok: false, error: 'project-not-found', name: String(ref) };
+      via = r.via;
+    }
+    const projectId = projectIdOf(page.url());
+    if (!projectId) {
+      return {
+        ok: false, error: 'not-in-project', url: page.url(),
+        hint: '先 project <项目名>（或直接传项目 URL / g-p-id）',
+      };
+    }
+    // 切到「来源」页签（已在来源页时点一下会关掉，所以先读 aria-selected）
+    const tab = page.locator('[role="tab"]', { hasText: /^\s*来源\s*$/ }).first();
+    if (await tab.count()) {
+      const selected = await tab.getAttribute('aria-selected').catch(() => null);
+      if (selected !== 'true') { await tab.click(); await sleep(1200); }
+    }
+    // 首次进入时列表可能还在渲染：轮询到出现行或超时
+    const deadline = Date.now() + 12000;
+    let sources = [];
+    do {
+      sources = await readProjectSources(page);
+      if (sources.length) break;
+      if (Date.now() < deadline) await sleep(600);
+    } while (Date.now() < deadline);
+    const tabUrl = `https://chatgpt.com/g/${projectId}/project?tab=sources`;
+    return {
+      ok: true, url: page.url(), projectUrl: `https://chatgpt.com/g/${projectId}/project`, tabUrl,
+      projectId, count: sources.length, sources, via,
+      note: sources.length
+        ? '这些来源已挂在项目里：prompt 里点名文件名即可让 GPT 直接读，**不要重复上传**'
+        : '没读到来源行：项目可能为空，或列表尚未渲染（可再跑一次 / 用 goto 打开 tabUrl）',
+    };
   });
 }
 
@@ -518,6 +662,9 @@ async function cmdSend(args) {
       // pendingText 已在上面算好并写进 tabs（供下次 send 区分"自己的残留"与"真脏状态"）
       pendingText,
       url, ...ids, turnsBefore: before,
+      // 项目空间里发消息会自动长成项目内的新会话；把这两层链接显式给出来，方便上层存档
+      projectId: ids.projectId ?? projectIdOf(url),
+      conversationUrl: ids.conversationId && !ids.temporary ? url : null,
       requestId, ...budget,
     };
     // 幂等记录：只有确认 submitted 才标记 sent，避免"没发出去"被当成已发送
@@ -1215,7 +1362,7 @@ async function cmdImage(args) {
 }
 
 const CMDS = { launch: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
-  new: cmdNew, project: cmdProject, send: cmdSend, wait: cmdWait, read: cmdRead,
+  new: cmdNew, project: cmdProject, sources: cmdSources, send: cmdSend, wait: cmdWait, read: cmdRead,
   model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
   init: cmdInit, config: cmdConfig, image: cmdImage };
 
@@ -1242,7 +1389,10 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   tabs                         列出标签页
   goto <url>                   打开指定会话/项目 URL
   new                          新聊天
-  project <项目名>             进入项目上下文（项目内新聊天）
+  project <项目名|URL|g-p-id>   进入项目空间（项目首页：在这里发消息会长成项目内的新会话）
+                               项目内会话的链接形如 /g/<g-p-id>/c/<conversation-uuid>
+  sources [项目名|URL]         列出项目已挂载的来源文件（名称/类型/日期）
+                               ★ 项目来源所有会话共享：prompt 里点名文件名即可，不要重复上传
   send --text <内容> [--file f] 发送消息（可带附件）
   wait [--timeout 600]         等待回复完成
   read [--md] [--save]         读取最后一条回答（含图片/代码块）
@@ -1288,7 +1438,7 @@ async function main() {
   if (!fn) { console.error(`未知命令: ${cmd}\n\n${HELP}`); process.exit(2); }
 
   // 会改动会话状态的命令需要互斥，避免多 agent 串线（读到别人的回答）
-  const NEEDS_LOCK = new Set(['new', 'project', 'goto', 'send', 'wait', 'read', 'ask']);
+  const NEEDS_LOCK = new Set(['new', 'project', 'sources', 'goto', 'send', 'wait', 'read', 'ask']);
   let locked = false;
   try {
     if (NEEDS_LOCK.has(cmd) && args.lock !== false) {

@@ -44,6 +44,7 @@ description: 用确定性命令操控网页版 ChatGPT（复用已登录会话�
 | **新增一个网页渠道（先读这个再动手）** | [`references/DESIGN-multichannel.md`](references/DESIGN-multichannel.md) §6 渠道薄壳 |
 | 多渠道架构与圆桌讨论标准 | [`references/DESIGN-multichannel.md`](references/DESIGN-multichannel.md) |
 | 排障 / DOM 改版 | `references/` 下对应文件 |
+| **要在某个"项目"里问、且项目里已经挂了资料** | 本文件 **§13 项目空间**（先 `sources` 看看有啥，别重复上传） |
 
 **已经把"这台机器配好了"记在机器状态里**（`~/.chatgpt-web/STATE.json`），
 所以：**配好之后不要再读 `INIT.md`、不要重新探测浏览器、不要问用户登录的事了。**
@@ -179,11 +180,15 @@ node <skill>/scripts/chatgpt.mjs method --v 2 --e 0 --p 0 --a 0 --m 0 --f 0 --x 
 
 ### Step 2｜选上下文
 - 默认：`new`（普通新聊天）。
-- 用户说"在 X 项目里问"：`project X`，并确认 placeholder 变成 `"X中的新聊天"`；否则说明没进项目。
+- 用户说"在 X 项目里问"：`project X`（项目名 / 项目 URL / `g-p-id` 都行）。
+  **判据是返回里的 `projectId` / `inProject: true`**，不是"点了没报错"（点项目行只展开列表，URL 不变）。
+- ★ 进项目后**先跑 `sources`**：项目里已有的资料是**项目级共享**的，
+  prompt 里点名文件名即可，**不要重复上传**（详见 §13）。
 - 接着旧会话：`goto <url>`。
 
 ### Step 3｜组织上下文（关键质量点）
 - 大文件不要整篇贴进 prompt：用 `send --file <绝对路径>` 上传，让 GPT 自己读。
+  **若文件已在项目来源里，就别上传** —— 直接点名文件名（`sources` 输出的 `name` 原样照抄）。
 - prompt 里明确四件事：**角色/目标、判断标准、输出格式、不确定时怎么办**。
 - 一次只问一件事。需要多方比较时，分开提问而不是堆在一段里。
 
@@ -199,6 +204,8 @@ node <skill>/scripts/chatgpt.mjs wait --timeout 600 --json
 ```
 - `send` 必须在 JSON 里看到 `submitted: true`，且 `uploadedCount` 等于你传的附件数；
   数量不符或 `pendingText` 非空 → 说明没提交成功，**不要**进入 wait。
+- ★ 在项目空间里发消息时，`send` 会额外返回 `projectId` 与 `conversationUrl`
+  —— 那就是"项目下的这个聊天窗口"的永久链接，**存档时记它**（形态见 §13.2）。
 - `send` 会自动记录本次请求基线（`baselineTurns`），`wait` 读它并只认**基线之后新增的轮次**；
   因此**不要手工传 baseline**，也不要跳过 `send` 直接 `wait`。
 - `wait` 返回 `status: "success"` 才算完成。`status` 是稳定状态码，见下表，
@@ -819,4 +826,59 @@ t=40s  正文一次性出现         ← 真正的完成信号
 
 ✅ 引擎现在的做法：点触发器**之前**先按一次 `Escape` 归零（顺带也能关掉落地弹窗）。
 
+## 13｜项目空间（Projects）：已有资料不用重传（2026-10-22 打通）
 
+普通 `new` 是"干净的陌生人"；**项目空间**是"已经知道你家底的同事" ——
+项目里挂着 sources（来源文件），**项目内所有会话共享**，所以：
+
+> ★ **不要把项目已有的资料再上传一遍。** prompt 里点名文件名，让 GPT 自己去读。
+
+### 13.1｜三步走
+
+```bash
+node <skill>/scripts/chatgpt.mjs project "海外剧本1"            # 进入项目（项目首页）
+node <skill>/scripts/chatgpt.mjs sources --json                # 看项目里已经挂着什么（名称/类型/日期）
+node <skill>/scripts/chatgpt.mjs send --text-file prompt.md    # 在这里发消息 → 自动长成项目内新会话
+node <skill>/scripts/chatgpt.mjs wait --timeout 600 --json
+node <skill>/scripts/chatgpt.mjs read --md
+```
+
+- `project` 接受 **项目名 / 项目 URL / `g-p-<id>`** 三种写法。给 id 或 URL 时会直接 `goto`，
+  不绕首页（更快，也没有同名项目歧义）。
+- 进没进项目的**唯一判据是 URL 里的 `projectId`**：点侧边栏项目行本身**只展开/收起列表、不改 URL**，
+  所以"点了没报错"绝不能当成功（见 12.2）。
+- `sources` 必须在项目页上跑：不带参数时用当前页，带项目名时先 `project` 再读。
+
+### 13.2｜会话链接有两种形态，都要认
+
+```
+地址栏（带名字 slug）：https://chatgpt.com/g/g-p-<id>-hai-wai-ju-ben-1/c/<uuid>
+侧边栏（规范形）：      https://chatgpt.com/g/g-p-<id>/c/<uuid>
+```
+
+`convIds()` 现在两种都解析，`projectId` / `conversationId` 都会返回。
+`sources` 与 `project` 返回的 `projectUrl` / `tabUrl` 用的是**不带 slug** 的规范形（打开同样有效）。
+
+### 13.3｜实测基线（2026-10-22，本机 9444）
+
+| 项 | 实测值 |
+|---|---|
+| 项目 | 海外剧本1（`g-p-6ad8e0179268819190d7a75acc86b8d4`），来源 **20 个 .md** |
+| 请求 | 不上传附件，直接要求"完整读 `Z00-短剧最高创作原则.md`，抄一级标题 + 逐字引用首句 + 说与 `Z5` 的分工" |
+| `uploadedCount` | **0**（确认没有重传） |
+| `wait` 耗时 | **174.8s**（读完两个文件再答，比普通问答慢；`--timeout` 别按 60s 给） |
+| 结果可信度 | 回答末尾**回引了文件名**（`Z00-短剧最高创作原则.md`、`Z5-对白优化规则.md`），并给出 978 行 / 约 1.45 万字符这类只有真读过才知道的细节 |
+| 会话链接 | `/g/g-p-6ad8e0179268819190d7a75acc86b8d4-hai-wai-ju-ben-1/c/6ad8e5cc-3bec-83ea-abdb-baf6039775db` |
+| 侧边栏 | 新会话「项目文件读取验证」确实出现在「海外剧本1」项目下 |
+
+### 13.4｜坑位清单
+
+1. **侧边栏项目区是异步渲染的**：`goto` 后 2s 还是 0 行、3.5s 才出现。固定 `sleep(2000)` 会误报
+   `project-not-found`（旧实现就是这么挂的）。现在的做法是**轮询等行出现**（≤15s）。
+2. **入口按钮换了名字**：旧版 `button[aria-label="打开项目首页"]` 已消失，新版是
+   `button[aria-label="在 <项目名> 中开启新聊天"]`（名字两侧带空格，用"包含"匹配）。
+3. **`div[class*="project-source"]` 是假命中**：会匹配到行内子元素（日期/操作区），`count()` = 20
+   但每行 `innerText` 为空 → 解析出 0 条。**必须用 `li[class*="project-source"]`**。
+   这类"计数正常、内容是空"的失败最容易骗过人，解析后一定要校验条目数。
+4. **「来源」页签是开合按钮**：已在来源页时再点会切回「聊天」。先读 `aria-selected` 再决定点不点（同 12.13）。
+5. **项目来源不是附件**：`send` 的 `uploadedCount` 与它无关；别把"项目里有文件"当成"附件已挂上"。

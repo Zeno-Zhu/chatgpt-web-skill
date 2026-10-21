@@ -506,12 +506,19 @@ const RE_TMP = /\/c\/((?:WEB|local-chatgpt)[:%][0-9a-f-]+)/i;
 const RE_UUID = /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
 export function convIds(url) {
-  const m = url.match(/\/g\/(g-p-[0-9a-f]+)\/c\/([0-9a-f-]+)/);
+  // 2026-10-22 实测：项目内会话的路径段是 `g-p-<hex>-<slug>`（slug 由项目名转写，如 -hai-wai-ju-ben-1），
+  // 早期写法只认 `g-p-<hex>/c/...`，结果 projectId 恒为 null（项目链接丢失）。
+  const m = url.match(/\/g\/(g-p-[0-9a-f]+)(?:-[^/]*)?\/c\/([0-9a-f-]+)/);
   if (m) return { projectId: m[1], conversationId: m[2], temporary: false };
   const u = url.match(RE_UUID);
-  if (u) return { projectId: null, conversationId: u[1], temporary: false };
+  if (u) {
+    // 兜底：URL 在项目路径下但 /c/ 段没解析出来时，也别把 projectId 丢掉
+    const p = url.match(/\/g\/(g-p-[0-9a-f]+)(?:-[^/]*)?(?:\/|$)/);
+    return { projectId: p ? p[1] : null, conversationId: u[1], temporary: false };
+  }
   const t = url.match(RE_TMP);
-  return { projectId: null, conversationId: t ? t[1] : null, temporary: !!t };
+  const p2 = url.match(/\/g\/(g-p-[0-9a-f]+)(?:-[^/]*)?(?:\/|$)/);
+  return { projectId: p2 ? p2[1] : null, conversationId: t ? t[1] : null, temporary: !!t };
 }
 
 // ---------- 并发隔离 ----------
