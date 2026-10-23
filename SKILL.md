@@ -111,7 +111,7 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 | Compose | `send --text-file ... [--file ...]` | ❌ **重跑 = 再发一条消息** |
 | Wait | `wait [--timeout 秒]` | ✅ 只观察（会消费基线） |
 | Read | `read [--md] [--save]` | ✅ 只读；`--save` 会再落一份文件 |
-| Inspect | `tabs` / `model [名]` | ✅ 只读（`model` 带参会切换） |
+| Inspect | `tabs` / `windows` / `model [名]` | ✅ 只读；`windows` 按窗口汇总 slot 归属与默认落点，**多窗口时先跑它**（不加锁，busy 也能跑）；`model` 带参会切换 |
 | Image | `image start` | ❌ **重跑 = 再开一个会话再生一张**（要防重就用 `--request-id` 之外的 jobId 记账；先 `image list` 看清在途） |
 | Image | `image list` / `wait` / `download` | ✅ 只读；`download` 会再落一份文件 |
 | Route | `route --impact N --uncertainty N --gap N` | ✅ 纯计算，决定该不该调用 |
@@ -122,6 +122,11 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
   不带 slot 时使用原有全局锁，带 slot 时按 slot 隔离。相同 slot 被占用返回 `status: busy`。
 
 ### 多个调用窗口并行使用
+
+**动手前先确认身份，不要靠猜**：`node <skill>/scripts/chatgpt.mjs windows`
+—— 只读、不加锁（`busy` 时也能跑），一次列出「有几个窗口 / 每页归哪个 slot / 无 slot 命令会落到哪页 /
+有没有同一个会话被两个窗口同时打开」。看到 `⛔ 同一会话被多个窗口同时打开` 就先解决它，
+否则两个窗口并行 `send/wait` 必串线（读到对方的回答）。
 
 同一浏览器、同一登录 profile 可以同时打开多个**独立的浏览器窗口**。按第 0 节给每个聊天设置不同的
 `CHATGPT_OUT_DIR` 任务目录后，所有宿主都会自动用该目录作为窗口身份；无需 Codex。
@@ -146,6 +151,11 @@ CHATGPT_OUT_DIR=/abs/task-b node <skill>/scripts/chatgpt.mjs new --json
 关掉该窗口后命令返回 `SLOT_PAGE_CLOSED`；确认要重建时用同一个 `CHATGPT_OUT_DIR` 运行
 `slot reset`，再运行 `new`。
 不带 slot 的旧命令仍可用，并且不会选中已分配给 slot 的窗口。`image` 使用原有全局任务账本，暂不带 slot。
+
+> 📖 完整判据（状态文件、身份优先级、并行边界、实测数据、踩过的坑、关闭单窗口的做法）：
+> **`references/multi-window.md`（唯一真源）**。
+> 一句话记住：**同一聊天的 new/send/wait/read 必须始终用同一个 slot 值**；
+> 不同 slot 可并行，同一 slot 内串行；`stop` 会关整个浏览器，⛔ 不能用它关单个窗口。
 
 `send` 会写 `uploadedCount`，**必须等于你传入的附件数**；不等说明附件没挂上，不要继续。
 

@@ -326,6 +326,116 @@ async function cmdTabs({ json } = {}) {
   }
 }
 
+// 多窗口盘点：按**顶层窗口**分组列出所有页面，标出每页归属哪个 slot，
+// 以及「不带 slot 的命令会落到哪一页」。目的是省掉"到底是哪个窗口"的人工排查。
+// 只读、不加互斥锁 —— 盘点窗口不该被 busy 挡住。
+async function cmdWindows({ json } = {}) {
+  const browser = await connectEnsured();
+  try {
+    const ctx = browser.contexts()[0];
+    const native = await browser.newBrowserCDPSession();
+    const rows = [];
+    for (const p of ctx.pages()) {
+      const tid = await targetId(p).catch(() => null);
+      let winId = null;
+      if (tid) {
+        try {
+          winId = (await native.send('Browser.getWindowForTarget', { targetId: tid })).windowId;
+        } catch { /* 页面正在关闭 */ }
+      }
+      rows.push({ targetId: tid, windowId: winId, url: p.url(), title: await p.title().catch(() => '') });
+    }
+
+    // 反查 slot：状态目录里所有同时带 slot + targetId 的记录（tab-<slot>.json）
+    const claims = new Map();
+    const slots = [];
+    try {
+      for (const name of fs.readdirSync(STATE_DIR)) {
+        if (!name.endsWith('.json')) continue;
+        let rec = null;
+        try { rec = JSON.parse(fs.readFileSync(path.join(STATE_DIR, name), 'utf8')); } catch { continue; }
+        if (!rec || !rec.slot || !rec.targetId) continue;
+        claims.set(rec.targetId, rec.slot);
+        slots.push({
+          slot: rec.slot,
+          targetId: rec.targetId,
+          windowId: rec.windowId ?? null,
+          file: name,
+          alive: rows.some((r) => r.targetId === rec.targetId),
+        });
+      }
+    } catch { /* 状态目录尚不存在 */ }
+
+    for (const r of rows) r.slot = claims.get(r.targetId) || null;
+
+    // 不带 slot 时 getPage() 只在「未被认领」的页面里选 —— 这里给出同一判据的结果
+    const unclaimed = rows.filter((r) => !r.slot);
+    const pick = unclaimed.find((r) => /^https:\/\/(?:chatgpt\.com|chat\.openai\.com)(?:\/|$)/.test(r.url))
+      || unclaimed[0] || null;
+    for (const r of rows) r.isDefault = pick ? r.targetId === pick.targetId : false;
+
+    const byWin = new Map();
+    for (const r of rows) {
+      const k = r.windowId ?? 'unknown';
+      if (!byWin.has(k)) byWin.set(k, { windowId: r.windowId, slots: [], targets: [] });
+      const w = byWin.get(k);
+      w.targets.push({ ...r, ...convIds(r.url) });
+      if (r.slot && !w.slots.includes(r.slot)) w.slots.push(r.slot);
+    }
+    const windows = [...byWin.values()];
+    const deadSlots = slots.filter((s) => !s.alive);
+
+    // 同一会话被多个窗口打开 = 并行操作必然串线（两个 agent 读同一段回答）。
+    // 这不是理论风险，实测就会出现（用户手动开的窗口 + 任务窗口落到同一会话）。
+    const convWindows = new Map();
+    for (const w of windows) {
+      for (const t of w.targets) {
+        const cid = t.conversationId;
+        if (!cid) continue;
+        if (!convWindows.has(cid)) convWindows.set(cid, new Set());
+        convWindows.get(cid).add(w.windowId);
+      }
+    }
+    const duplicates = [...convWindows.entries()]
+      .filter(([, wins]) => wins.size > 1)
+      .map(([conversationId, wins]) => ({ conversationId, windows: [...wins] }));
+    for (const w of windows) {
+      for (const t of w.targets) {
+        t.sharedConversation = Boolean(t.conversationId && convWindows.get(t.conversationId)?.size > 1);
+      }
+    }
+
+    if (json) return { ok: true, windows, slots, defaultTargetId: pick ? pick.targetId : null, deadSlots, duplicates };
+
+    const lines = [`共 ${windows.length} 个窗口 / ${rows.length} 个页面`];
+    windows.forEach((w, i) => {
+      lines.push('');
+      lines.push(`窗口 ${i + 1}  windowId=${w.windowId}${w.slots.length ? `  slot=${w.slots.join(' + ')}` : '  （无 slot）'}`);
+      for (const t of w.targets) {
+        const tags = [t.slot ? `slot=${t.slot}` : '未分配'];
+        if (t.isDefault) tags.push('← 无 slot 命令默认落这里');
+        if (t.sharedConversation) tags.push('⚠️ 同一会话在多个窗口');
+        lines.push(`  · ${t.title || '(无标题)'}  [${tags.join('  ')}]`);
+        lines.push(`    ${t.url}`);
+      }
+    });
+    if (duplicates.length) {
+      lines.push('');
+      lines.push(`⛔ ${duplicates.length} 个会话被多个窗口同时打开（${duplicates.map((d) => d.conversationId.slice(0, 8)).join(', ')}）：`);
+      lines.push('   在两个窗口里并行 send/wait 会串线（读到对方的回答）。');
+      lines.push('   处置：一个会话只留一个窗口，另一个窗口 new 一个独立会话；或改用不同会话并行。');
+    }
+    if (deadSlots.length) {
+      lines.push('');
+      lines.push(`⚠️ ${deadSlots.length} 个 slot 记录指向已关闭的窗口：${deadSlots.map((d) => d.slot).join(', ')}`);
+      lines.push('   确认不再需要再执行：slot reset --slot <名>');
+    }
+    return { ok: true, text: lines.join('\n') };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
 async function cmdSlot(args) {
   const sub = args._[0] || 'status';
   const slot = getActiveSlot();
@@ -1376,7 +1486,7 @@ async function cmdImage(args) {
   };
 }
 
-const CMDS = { launch: cmdLaunch, ensure: cmdLaunch, status: cmdStatus, tabs: cmdTabs, slot: cmdSlot, goto: cmdGoto,
+const CMDS = { launch: cmdLaunch, ensure: cmdLaunch, status: cmdStatus, tabs: cmdTabs, windows: cmdWindows, slot: cmdSlot, goto: cmdGoto,
   new: cmdNew, project: cmdProject, sources: cmdSources, send: cmdSend, wait: cmdWait, read: cmdRead,
   model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
   init: cmdInit, config: cmdConfig, image: cmdImage };
@@ -1403,6 +1513,8 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   ensure                       同 launch（统一生命周期入口；日常不用手跑，别的命令会自动调）
   status                       连接状态 + 登录态 + 绑定 + 当前会话 id
   tabs                         列出标签页
+  windows                      按窗口汇总：每个窗口/页面归属哪个 slot、无 slot 命令默认落哪页
+                               ★ 多窗口并行时**先跑这个**确认身份，别靠猜；只读，不会被 busy 挡住
   slot status --slot <名>     查看本聊天绑定的浏览器窗口；关闭后用 slot reset --slot <名> 重建
   goto <url>                   打开指定会话/项目 URL
   new                          新聊天
