@@ -4,12 +4,15 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import {
   launchChrome, connect, getPage, isLoggedIn, waitForCompletion, acquireLock, releaseLock,
   sleep, convIds, readTabs, writeTabs, cdpAlive, CDP_URL, PROFILE, AGENT, CDP_PORT, CHROME,
   BINDING, SKILL_DIR, PROFILE_DIRECTORY, CHROME_SOURCE, CHROME_MISSING, checkCdpProfile,
   listInstalledBrowsers, openNewChat, normalizeUserPath, requireDriveAbsolute,
+  setActiveSlot, getActiveSlot, slotScope,
 } from './lib.mjs';
+import { resetSlot, slotName, targetId, slotFile } from './slot-page.mjs';
 import {
   CONFIG_FILE, readConfig, writeConfig, describeBinding, detectProfiles, resolveBinding,
 } from './config.mjs';
@@ -315,12 +318,27 @@ async function cmdTabs({ json } = {}) {
   try {
     const ctx = browser.contexts()[0];
     const pages = ctx.pages();
-    const tabs = await Promise.all(pages.map(async (p, i) => ({ i, url: p.url(), title: await p.title() })));
+    const tabs = await Promise.all(pages.map(async (p, i) => ({ i, targetId: await targetId(p).catch(() => null), url: p.url(), title: await p.title() })));
     if (json) return { ok: true, tabs };
     return { ok: true, text: tabs.map((t) => `[${t.i}] ${t.title}  ${t.url}`).join('\n') };
   } finally {
     await browser.close().catch(() => {});
   }
+}
+
+async function cmdSlot(args) {
+  const sub = args._[0] || 'status';
+  const slot = getActiveSlot();
+  if (!slot) return { ok: false, error: 'SLOT_REQUIRED', hint: '设置该聊天的 CHATGPT_OUT_DIR，或使用 --slot / CHATGPT_SLOT' };
+  if (sub === 'reset') {
+    const reset = resetSlot(slot, slotScope());
+    fs.rmSync(path.join(STATE_DIR, `tabs${slotScope()}-${slot}.json`), { force: true });
+    return { ok: true, slot, reset };
+  }
+  if (sub !== 'status') return { ok: false, error: 'usage: slot [status|reset] --slot <窗口名>' };
+  const file = slotFile(slot, slotScope());
+  try { return { ok: true, slot, record: JSON.parse(fs.readFileSync(file, 'utf8')) }; }
+  catch { return { ok: true, slot, record: null }; }
 }
 
 async function cmdGoto(args) {
@@ -556,6 +574,7 @@ async function cmdSend(args) {
 
   return withPage(async (page) => {
     if (!(await isLoggedIn(page))) return { ok: false, error: 'NOT_LOGGED_IN', url: page.url() };
+    const initialConversation = convIds(page.url());
     const before = await page.locator(SELECTORS.assistant).count();   // assistant 消息数基线（无歧义）
 
     let uploaded = [];
@@ -639,6 +658,8 @@ async function cmdSend(args) {
     const t = readTabs();
     t.lastUrl = url;
     t.baselineAssistant = before;
+    // 新聊天的首个 UUID 仍可能是过渡 URL；只对发送前已存在的会话校验漂移。
+    t.expectConversationId = initialConversation.temporary ? null : initialConversation.conversationId;
     if (ids.conversationId && !ids.temporary) t.conversationId = ids.conversationId;
     else delete t.conversationId;   // 拿不到稳定 id 就不要留一个会误报漂移的旧值
     t.sentAt = new Date().toISOString();
@@ -679,7 +700,7 @@ async function cmdWait(args) {
   const t = readTabs();
   // 基线优先取 send 记录的 turnsBefore（自动绑定"本次请求"），允许命令行覆盖
   const baselineAssistant = Number(args.baseline ?? t.baselineAssistant ?? 0);
-  const expectConversationId = args.conversation || t.conversationId || null;
+  const expectConversationId = args.conversation || (Object.hasOwn(t, 'expectConversationId') ? t.expectConversationId : t.conversationId) || null;
   return withPage(async (page) => {
     const r = await waitForCompletion(page, {
       timeoutMs, pollMs, baselineAssistant, expectConversationId,
@@ -690,6 +711,7 @@ async function cmdWait(args) {
     // 消费掉基线：避免下一次 wait 复用过期基线导致漏判
     delete t.baselineAssistant;
     t.lastUrl = page.url();
+    if (r.done && ids.conversationId && !ids.temporary) t.conversationId = ids.conversationId;
     writeTabs(t);
     return {
       ok: r.done, done: r.done, status: r.status ?? (r.done ? 'success' : 'unknown'),
@@ -856,10 +878,10 @@ async function cmdRoute(args) {
 }
 
 // ---------- request 记录（幂等发送的基础） ----------
-function reqPath(id) { return path.join(REQ_DIR, `${id}.json`); }
+function reqPath(id) { return path.join(REQ_DIR, ...(AGENT !== 'default' ? [AGENT] : []), ...(getActiveSlot() ? [getActiveSlot()] : []), `${id}.json`); }
 function reqLoad(id) { try { return JSON.parse(fs.readFileSync(reqPath(id), 'utf8')); } catch { return null; } }
 function reqSave(id, obj) {
-  fs.mkdirSync(REQ_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(reqPath(id)), { recursive: true });
   fs.writeFileSync(reqPath(id), JSON.stringify(obj, null, 2));
 }
 
@@ -968,7 +990,7 @@ async function cmdAsk(args) {
   const read = await cmdRead({ save: args.save, md: args.md, json: args.json });
   return {
     ok: true,
-    url: send.url, projectId: send.projectId, conversationId: send.conversationId,
+    url: read.url, projectId: read.projectId, conversationId: read.conversationId,
     uploaded: send.uploaded, attempts: send.attempts, attachmentReady: send.attachmentReady,
     pendingText: send.pendingText,
     elapsedMs: wait.elapsedMs, viaFallback: wait.viaFallback,
@@ -1354,7 +1376,7 @@ async function cmdImage(args) {
   };
 }
 
-const CMDS = { launch: cmdLaunch, ensure: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
+const CMDS = { launch: cmdLaunch, ensure: cmdLaunch, status: cmdStatus, tabs: cmdTabs, slot: cmdSlot, goto: cmdGoto,
   new: cmdNew, project: cmdProject, sources: cmdSources, send: cmdSend, wait: cmdWait, read: cmdRead,
   model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
   init: cmdInit, config: cmdConfig, image: cmdImage };
@@ -1381,6 +1403,7 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   ensure                       同 launch（统一生命周期入口；日常不用手跑，别的命令会自动调）
   status                       连接状态 + 登录态 + 绑定 + 当前会话 id
   tabs                         列出标签页
+  slot status --slot <名>     查看本聊天绑定的浏览器窗口；关闭后用 slot reset --slot <名> 重建
   goto <url>                   打开指定会话/项目 URL
   new                          新聊天
   project <项目名|URL|g-p-id>   进入项目空间（项目首页：在这里发消息会长成项目内的新会话）
@@ -1408,6 +1431,7 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   --json          输出协议 JSON（含 protocol_version / code / state / request_id）
   --no-envelope   关闭协议信封，只回原始字段
   --request-id X  幂等键：同一 id 重复 send 不会重复发送
+  --slot X        窗口名：同一浏览器内固定独立窗口、等待基线和锁
   --max-chars N   read 返回上限（默认 4000，原文更长时截断并给出 readRatio）
   --save          落盘图片（写到 CHATGPT_OUT_DIR）
 环境（优先级：环境变量 > ~/.chatgpt-web/config.json > <skill>/.env.agent > 默认值）：
@@ -1417,7 +1441,8 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   CHATGPT_PROFILE_DIRECTORY  user-data-dir 里的 profile 名（Default / Profile 1 …）
   CHATGPT_CDP_PORT    覆盖端口
   CHATGPT_CONFIG      覆盖 config.json 路径
-  CHATGPT_OUT_DIR     产物落盘目录
+  CHATGPT_OUT_DIR     每个聊天的任务目录，同时用作自动窗口身份
+  CHATGPT_SLOT        等价于每次传 --slot；没有任务目录时为每个聊天设置不同值
 
 绑定命令：chatgpt-web init            # 探测本机可用的浏览器与已登录 profile，给出建议命令
           chatgpt-web init --browser "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" \\
@@ -1427,12 +1452,25 @@ async function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const args = parseArgs(argv.slice(1));
+  const pageCommands = new Set(['status', 'new', 'project', 'sources', 'goto', 'send', 'wait', 'read', 'ask', 'model', 'slot']);
+  // 任务目录是各宿主共用的稳定身份；Codex 线程 ID 只作为没有任务目录时的备用来源。
+  const taskDir = process.env.CHATGPT_OUT_DIR;
+  const normalizedTaskDir = taskDir ? path.resolve(taskDir) : null;
+  const taskSlot = normalizedTaskDir
+    ? `task-${crypto.createHash('sha256').update(process.platform === 'win32' ? normalizedTaskDir.toLowerCase() : normalizedTaskDir).digest('hex').slice(0, 20)}`
+    : null;
+  setActiveSlot(slotName(args.slot || process.env.CHATGPT_SLOT || (pageCommands.has(cmd) ? taskSlot || process.env.CODEX_THREAD_ID : null)));
   if (!cmd || cmd === 'help' || args.help) { console.log(HELP); return; }
   const fn = CMDS[cmd];
   if (!fn) { console.error(`未知命令: ${cmd}\n\n${HELP}`); process.exit(2); }
+  if (cmd === 'image' && getActiveSlot()) {
+    emit({ ok: false, error: 'IMAGE_SLOT_UNSUPPORTED', hint: '生图任务共用全局账本，请不带 --slot 使用 image 命令' }, args);
+    process.exitCode = 1;
+    return;
+  }
 
   // 会改动会话状态的命令需要互斥，避免多 agent 串线（读到别人的回答）
-  const NEEDS_LOCK = new Set(['new', 'project', 'sources', 'goto', 'send', 'wait', 'read', 'ask']);
+  const NEEDS_LOCK = new Set(['status', 'new', 'project', 'sources', 'goto', 'send', 'wait', 'read', 'ask', 'model', 'slot']);
   let locked = false;
   try {
     if (NEEDS_LOCK.has(cmd) && args.lock !== false) {

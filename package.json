@@ -25,7 +25,7 @@
     "config": "node scripts/chatgpt.mjs config",
     "launch": "node scripts/chatgpt.mjs launch",
     "status": "node scripts/chatgpt.mjs status",
-    "test": "node --test tests/procs.test.mjs tests/lifecycle.test.mjs",
+    "test": "node --test tests/procs.test.mjs tests/lifecycle.test.mjs tests/slot-page.test.mjs tests/slot-routing.test.mjs",
     "e2e": "node scripts/e2e-smoke.mjs",
     "e2e:lifecycle": "node tests/lifecycle-e2e.mjs",
     "e2e:task-launch": "node tests/task-launch-e2e.mjs",

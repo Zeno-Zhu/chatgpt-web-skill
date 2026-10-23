@@ -118,8 +118,34 @@ Connect → Context → Compose → Send → Wait(Gate) → Read(Gate) → Commi
 
 - `send` 只有在**明确确认上次未提交**（`submitted: false`）时才可安全重跑。
 - `wait` 成功后不要重复 `send` 同一 prompt；需要追问请明确换内容。
-- 会改动会话状态的命令（`new/project/goto/send/wait/read/ask`）持有全局互斥锁，
-  被占用时返回 `status: busy`——**串行等待，不要并发硬闯**。
+- 会改动会话状态的命令（`new/project/goto/send/wait/read/ask`）持有互斥锁；
+  不带 slot 时使用原有全局锁，带 slot 时按 slot 隔离。相同 slot 被占用返回 `status: busy`。
+
+### 多个调用窗口并行使用
+
+同一浏览器、同一登录 profile 可以同时打开多个**独立的浏览器窗口**。按第 0 节给每个聊天设置不同的
+`CHATGPT_OUT_DIR` 任务目录后，所有宿主都会自动用该目录作为窗口身份；无需 Codex。
+没有任务目录时可为每个聊天固定不同的 `CHATGPT_SLOT`（或在每条命令传相同的 `--slot`）；
+Codex 聊天 ID 是最后的备用身份。
+一个 slot 对应一个顶层窗口、独立的等待基线、请求记录和锁；
+不同 slot 可并行等待与发送，同一 slot 内仍串行。
+
+```bash
+# 聊天窗口 A：固定使用自己的任务目录
+CHATGPT_OUT_DIR=/abs/task-a node <skill>/scripts/chatgpt.mjs new --json
+CHATGPT_OUT_DIR=/abs/task-a node <skill>/scripts/chatgpt.mjs send --text-file /abs/prompt-a.md --json
+CHATGPT_OUT_DIR=/abs/task-a node <skill>/scripts/chatgpt.mjs wait --json
+CHATGPT_OUT_DIR=/abs/task-a node <skill>/scripts/chatgpt.mjs read --json
+
+# 聊天窗口 B 使用另一个任务目录；可与 A 同时运行
+CHATGPT_OUT_DIR=/abs/task-b node <skill>/scripts/chatgpt.mjs new --json
+```
+
+首次使用 slot 会在已绑定的浏览器中创建一个独立窗口；之后按页面 ID 与窗口 ID 找回，不依赖前台焦点或窗口顺序。
+同一聊天的 `new/send/wait/read` 必须始终使用同一个任务目录。
+关掉该窗口后命令返回 `SLOT_PAGE_CLOSED`；确认要重建时用同一个 `CHATGPT_OUT_DIR` 运行
+`slot reset`，再运行 `new`。
+不带 slot 的旧命令仍可用，并且不会选中已分配给 slot 的窗口。`image` 使用原有全局任务账本，暂不带 slot。
 
 `send` 会写 `uploadedCount`，**必须等于你传入的附件数**；不等说明附件没挂上，不要继续。
 
@@ -351,7 +377,7 @@ node <skill>/scripts/chatgpt.mjs image run --text "画一张…"  # 单张：sta
 ## 6｜复盘与迭代
 
 1. 在任务目录保存：请求、关键输入与输出、验证结果、用户修正、成功或失败原因。**不要**默认收集整段原始会话。
-2. 一次只改一个目标文件。同类证据积累足够后，新建 evolution 任务目录，先跑 `dry-run` 无改动预检，再产出候选与对照验证；候选只能暂存，必须经过独立**审阅**报告后才允许**采用**，定时任务不得自动采用。
+2. 一次只改一个目标文件。同类证据积累足够后，新建 evolution 任务目录，先跑 `dry-run` 无改动预检，再产出候选与对照验证；用户明确要求优化本 Skill 时，候选通过内部差异检查与对照验证后直接采用，保留原版备份和验收证据，无需再次审阅确认；定时自动采用需用户明确要求。
 3. 只把**重复出现且已定位**的问题变成规则；重复的人工动作才脚本化。
 4. 进化必须能 Add / Modify / **Remove**。用户契约、权限边界与平台硬限制属 Protected Rules，不因近期样本无退步而删除。
 5. 质量候选需在 key 指标上无不可接受退步，并保留 **held-out / 留出集** 门禁防止过拟合。

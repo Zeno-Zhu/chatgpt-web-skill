@@ -11,6 +11,18 @@
 // ⚠️ 关闭语义：这里对 browser.close() 只是**断开 Playwright 的 CDP 连接**，
 //    不会关闭用户真实的 Chrome（Playwright 官方语义；2026-10-16 本机实测复核）。
 import { ensureBrowser } from './browser-lifecycle.mjs';
+import { getPage, getActiveSlot } from './lib.mjs';
+
+async function ensureReady(options) {
+  const deadline = Date.now() + 60000;
+  let result;
+  do {
+    result = await ensureBrowser(options);
+    if (result.state !== 'LOCK_BUSY') return result;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  } while (Date.now() < deadline);
+  return result;
+}
 
 function failEnvelope(r) {
   return {
@@ -31,9 +43,9 @@ export async function withEnsuredPage(
     ...options
   } = {}
 ) {
-  const r = await ensureBrowser({
+  const r = await ensureReady({
     ...options,
-    createPage: create
+    createPage: getActiveSlot() ? false : create
   });
 
   if (!r.ok) {
@@ -41,10 +53,11 @@ export async function withEnsuredPage(
   }
 
   try {
-    if (!r.page) {
+    const page = await getPage(r.browser, { create });
+    if (!page) {
       return { ok: false, error: 'no-chatgpt-tab', lifecycleState: r.state, actionsTaken: r.actionsTaken };
     }
-    return await fn(r.page, r);
+    return await fn(page, r);
   } finally {
     // 只断开 Playwright 的 CDP 连接，不关闭真实 Chrome
     await r.browser.close().catch(() => {});
@@ -59,7 +72,7 @@ export async function withEnsuredBrowser(
     ...options
   } = {}
 ) {
-  const r = await ensureBrowser({
+  const r = await ensureReady({
     ...options,
     createPage: create
   });
@@ -81,7 +94,7 @@ export async function commandEnsure({
   url = null,
   ...options
 } = {}) {
-  const r = await ensureBrowser({
+  const r = await ensureReady({
     ...options,
     headless,
     url: url || undefined
@@ -109,7 +122,7 @@ export async function commandEnsure({
 // 给直接调用 connect() 的老命令用：拿到一个已经 ensure 过的 Playwright Browser。
 // 返回的 browser 用完必须 close()（= 断开 CDP，不关 Chrome）。
 export async function connectEnsured(options = {}) {
-  const r = await ensureBrowser({
+  const r = await ensureReady({
     ...options,
     createPage: false
   });

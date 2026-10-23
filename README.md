@@ -27,6 +27,13 @@
 
 ## 快速开始（新机器 / 新 agent）
 
+多个聊天窗口共用一份登录浏览器时，给每个聊天设置不同的 `CHATGPT_OUT_DIR` 任务目录，Skill 会自动
+为每个目录打开独立的 Chrome 窗口，并隔离请求记录、等待基线和锁。无需 Codex。
+没有任务目录时，可为每个窗口指定不同的 `CHATGPT_SLOT`（或每条命令传 `--slot <窗口名>`）。
+例如窗口 A 使用 `CHATGPT_OUT_DIR=/abs/task-a`，窗口 B 使用 `CHATGPT_OUT_DIR=/abs/task-b`；各自的 `new → send → wait → read`
+可以并行。关闭某个窗口后，先运行 `slot reset --slot <窗口名>`，再用 `new --slot <窗口名>` 重建。
+生图命令继续使用全局任务账本，不带 slot。
+
 ```bash
 git clone <repo> chatgpt-web && cd chatgpt-web
 npm install                       # 或 npm install --offline

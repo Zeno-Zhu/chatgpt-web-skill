@@ -107,6 +107,7 @@ test('fake CDP endpoint never establishes browser ownership', async () => {
     );
 
   } finally {
+    server.closeAllConnections();
     await new Promise(resolve =>
       server.close(resolve)
     );
@@ -126,4 +127,5 @@ test('real config.json is understood (not CONFIG_INVALID)', async () => {
     'CONFIG_INVALID',
     `configOf 解析真实配置失败：${r.hint}`
   );
+  if (r.browser) await r.browser.close();
 });

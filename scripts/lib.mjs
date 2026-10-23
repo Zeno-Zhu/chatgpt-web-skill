@@ -9,6 +9,7 @@ import http from 'node:http';
 import { resolveBinding } from './config.mjs';
 import { scanBrowserProcesses, findCdpInstance, findProfileUser, samePath } from './procs.mjs';
 import { SELECTORS } from './compose.mjs';
+import { slotName, selectSlotPage, selectUnclaimedPage } from './slot-page.mjs';
 
 export { SELECTORS };
 
@@ -38,6 +39,11 @@ export const PROFILE_DIRECTORY = BINDING.keys.profileDirectory || null;export co
   || path.join(os.homedir(), '.chatgpt-web', `profile${SCOPE}`);
 export const STATE_DIR = path.join(os.homedir(), '.chatgpt-web');
 export const TABS_FILE = path.join(STATE_DIR, `tabs${SCOPE}.json`);
+let activeSlot = null;
+export function setActiveSlot(value) { activeSlot = slotName(value); }
+export function getActiveSlot() { return activeSlot; }
+export function slotScope() { return SCOPE; }
+const scopedStateFile = (stem) => path.join(STATE_DIR, `${stem}${SCOPE}${activeSlot ? `-${activeSlot}` : ''}.json`);
 
 // ---------- 用户传入路径的规范化（跨 shell 安全）----------
 // 2026-09-22 实测：在 Git Bash 里把 `/c/Users/x` 交给 Windows 版 node，它会被当成"当前盘符的相对路径"，
@@ -263,37 +269,19 @@ export async function connect() {
 }
 
 export function readTabs() {
-  try { return JSON.parse(fs.readFileSync(TABS_FILE, 'utf8')); } catch { return {}; }
+  try { return JSON.parse(fs.readFileSync(scopedStateFile('tabs'), 'utf8')); } catch { return {}; }
 }
 export function writeTabs(obj) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(TABS_FILE, JSON.stringify(obj, null, 2));
+  fs.writeFileSync(scopedStateFile('tabs'), JSON.stringify(obj, null, 2));
 }
 
 // 找到（或创建）ChatGPT 标签页。生图任务与普通对话**共用**同一个标签页：
 // "一个窗口"指的是 GPT 里的一个新会话（新聊天），不是浏览器标签页；
 // 每个会话的 URL 会被记账，之后按会话 id 直接取图（见 scripts/images.mjs）。
 export async function getPage(browser, { create = true } = {}) {
-  const ctx = browser.contexts()[0];
-  const match = () => ctx.pages().filter((p) => /chatgpt\.com/.test(p.url()));
-  let pages = match();
-  if (pages.length) return pages[pages.length - 1];
-  if (!create) return null;
-  // 2026-09-26 实测（Windows / Chrome 153）：launch 返回时页面**刚开始导航，p.url() 还是空字符串**，
-  // 上述过滤必然为空。若此刻立刻 newPage，就会在同一个 profile 里开出**第二个** chatgpt.com
-  // 页面（用户可见："每次同时打开两个 GPT 窗口"）。之后 getPage 取 pages[last] 拿到的是那个
-  // 后来的页面，操作目标漂移；两个同源页面还会互相干扰 —— 实测表现为间歇性
-  // NOT_LOGGED_IN、以及提交成功但 conversationId 恒为 null（会话根本没建立）。
-  // 所以先等已有页面把 URL 落定，等不到才新建。
-  const deadline = Date.now() + 20000;
-  do {
-    await sleep(500);
-    pages = match();
-    if (pages.length) return pages[pages.length - 1];
-  } while (Date.now() < deadline);
-  const page = await ctx.newPage();
-  await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  return page;
+  if (activeSlot) return selectSlotPage(browser, activeSlot, { create, scope: SCOPE });
+  return selectUnclaimedPage(browser, { create, scope: SCOPE });
 }
 
 // 注意：选择器已集中到 compose.mjs（单一事实源），本文件顶部 `export { SELECTORS }` 转出。
@@ -534,28 +522,37 @@ export function convIds(url) {
 // 并发任务会互相串线——而且会"看起来成功、只是答案属于别人"。
 // 最低成本方案：单 profile 全局互斥锁。
 export const LOCK_FILE = path.join(STATE_DIR, `lock${SCOPE}.json`);   // 按实例隔离：不同 agent 可并行
+const currentLockFile = () => scopedStateFile('lock');
 const STALE_MS = 15 * 60 * 1000;   // 超过 15 分钟视为崩溃残留
 
 export function acquireLock(job = 'unknown') {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  if (fs.existsSync(LOCK_FILE)) {
+  const file = currentLockFile();
+  let stoleFrom = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const cur = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-      const age = Date.now() - new Date(cur.at).getTime();
-      const alive = cur.pid && (() => { try { process.kill(cur.pid, 0); return true; } catch { return false; } })();
+      const fd = fs.openSync(file, 'wx');
+      try { fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, job, at: new Date().toISOString(), stoleFrom })); }
+      finally { fs.closeSync(fd); }
+      return stoleFrom ? { ok: true, stole: true, from: stoleFrom } : { ok: true };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let cur;
+      try { cur = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cur = null; }
+      const age = cur?.at ? Date.now() - new Date(cur.at).getTime() : Infinity;
+      const alive = cur?.pid && (() => { try { process.kill(cur.pid, 0); return true; } catch { return false; } })();
       if (alive && age < STALE_MS) return { ok: false, holder: cur };
-      // 残留锁：抢占并记录
-      fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, job, at: new Date().toISOString(), stoleFrom: cur }));
-      return { ok: true, stole: true, from: cur };
-    } catch { /* 锁文件损坏，下面覆盖 */ }
+      stoleFrom = cur;
+      try { fs.unlinkSync(file); } catch { /* 另一个进程可能已处理 */ }
+    }
   }
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, job, at: new Date().toISOString() }));
-  return { ok: true };
+  return { ok: false, holder: { job: 'lock-race', pid: null } };
 }
 
 export function releaseLock() {
+  const file = currentLockFile();
   try {
-    const cur = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-    if (cur.pid === process.pid) fs.rmSync(LOCK_FILE, { force: true });
+    const cur = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (cur.pid === process.pid) fs.rmSync(file, { force: true });
   } catch { /* 忽略 */ }
 }
