@@ -186,7 +186,7 @@ export function checkCdpProfile(port = CDP_PORT, profile = PROFILE) {
   };
 }
 
-export async function launchChrome({ headless = false } = {}) {
+export async function launchChrome({ headless = false, url = null } = {}) {
   if (await cdpAlive()) {
     // 已经有一个可调试实例：先确认它用的就是我们绑定的 profile，
     // 否则会"连上别的 Chrome、读到别人的会话"——看起来成功，实际是错的。
@@ -232,7 +232,11 @@ export async function launchChrome({ headless = false } = {}) {
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
-    'https://chatgpt.com/',
+    // ★ 2026-10-12：启动时可直接带目标 URL（例如既有会话链接
+    //   `https://chatgpt.com/c/<conversation_id>`）—— 恢复对话**一步到位**，
+    //   ⛔ 不要「先开首页 → 再 goto」，那会多一次加载、还可能在首页多开一个会话页，
+    //   让 getPage 选错目标。
+    (url || 'https://chatgpt.com/'),
   ];
   if (headless) args.unshift('--headless=new');
   let spawnError = null;
@@ -240,9 +244,13 @@ export async function launchChrome({ headless = false } = {}) {
   child.on('error', (e) => { spawnError = e; });
   child.unref();
 
-  const ok = await waitCdp(25000, () => !!spawnError);
+  // ★ 2026-10-12：原 25s 偏紧 —— 冷启动 + 加载 chatgpt.com 时，CDP 端口本身通常
+  //   3–10s 就绪，但机器忙/首次启动会拖到 40s+。放宽到 60s，避免把"还在启动"误判成"起不来"。
+  //   ⛔ 调用方也不要用裸 `curl` + 十几秒 sleep 自行判定失败 —— 那正是本函数要消除的误判。
+  const ok = await waitCdp(60000, () => !!spawnError);
   if (spawnError) return { launched: true, ok: false, reason: 'spawn-failed', detail: spawnError.message };
-  if (!ok) return { launched: true, ok: false, reason: 'cdp-timeout' };
+  if (!ok) return { launched: true, ok: false, reason: 'cdp-timeout',
+                    hint: '浏览器可能仍在启动；先 `status` 复查一次，再决定是否重启（⛔ 不要反复重拉）' };
   return { launched: true, ok: true, reason: 'started', profileVerified: true };
 }
 

@@ -14,8 +14,10 @@
     "THINKING.md",
     "README.md",
     "REVIEW.md",
+    "LICENSE",
     "references",
-    "scripts"
+    "scripts",
+    "tests"
   ],
   "scripts": {
     "doctor": "node scripts/chatgpt.mjs doctor",
@@ -23,7 +25,10 @@
     "config": "node scripts/chatgpt.mjs config",
     "launch": "node scripts/chatgpt.mjs launch",
     "status": "node scripts/chatgpt.mjs status",
+    "test": "node --test tests/procs.test.mjs tests/lifecycle.test.mjs",
     "e2e": "node scripts/e2e-smoke.mjs",
+    "e2e:lifecycle": "node tests/lifecycle-e2e.mjs",
+    "e2e:task-launch": "node tests/task-launch-e2e.mjs",
     "install-skills": "node scripts/install.mjs",
     "install-skills:bash": "bash scripts/install.sh"
   },

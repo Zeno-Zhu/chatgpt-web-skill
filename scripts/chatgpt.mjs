@@ -14,6 +14,11 @@ import {
   CONFIG_FILE, readConfig, writeConfig, describeBinding, detectProfiles, resolveBinding,
 } from './config.mjs';
 import { scanBrowserProcesses, samePath } from './procs.mjs';
+// 浏览器生命周期统一入口（V2）。所有命令都先经它"检测 → 校验 → 复用或启动"，
+// 而不是各自 connect() 到可能属于别人 profile 的 CDP 上。
+import {
+  withEnsuredPage, commandEnsure, connectEnsured,
+} from './lifecycle-adapter.mjs';
 import {
   SELECTORS, fillComposer, composerText, waitSendReady, submitComposer, lastAssistant,
   setDocumentFiles, probeAttachments,
@@ -111,71 +116,60 @@ function emit(obj, args) {
 // 全部收敛到 scripts/compose.mjs（与生图任务共用同一份选择器与注入/提交逻辑，
 // 改版时不会出现"改一处漏一处"）。说明见该文件顶部。
 
+// 统一入口：复用 / 校验 / 按需启动，全部收敛到 ensureBrowser()。
+// create=false 时允许"窗口里暂时没有 GPT 标签页"（status 这类只读命令）。
 async function withPage(fn, { create = true } = {}) {
-  const browser = await connect();
-  try {
-    const page = await getPage(browser, { create });
-    if (!page) return { ok: false, error: 'no-chatgpt-tab' };
-    return await fn(page);
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  return withEnsuredPage(fn, { create });
 }
 
+// launch 与 ensure 是同一件事：都走 ensureBrowser()。
+// 返回值保留原有的字段（cdp/browser/profile/...），同时把 lifecycle 的 state 一并暴露。
 async function cmdLaunch(args) {
-  const r = await launchChrome({ headless: args.headless === true });
+  const r = await commandEnsure({ headless: args.headless === true, url: args.url || args._?.[0] || null });
   const base = {
     cdp: CDP_URL, browser: CHROME, browserSource: CHROME_SOURCE,
     profile: PROFILE, profileDirectory: PROFILE_DIRECTORY, profileSource: BINDING.sources.userDataDir,
     agent: AGENT, configFile: BINDING.file,
   };
+  const manual = `"${CHROME}" --remote-debugging-port=${CDP_PORT} --user-data-dir="${PROFILE}"`
+    + (PROFILE_DIRECTORY ? ` --profile-directory=${PROFILE_DIRECTORY}` : '');
 
-  if (r.reason === 'already-running') {
-    return { ok: true, launched: false, profileVerified: r.profileVerified ?? null, ...base };
-  }
-  if (r.reason === 'chrome-not-found') {
+  if (r.ok) {
     return {
-      ok: false, error: 'CHROME_NOT_FOUND', platform: process.platform, ...base,
-      hint: CHROME_MISSING
-        ? `绑定的浏览器路径不存在：${BINDING.keys.browserPath}。用 init 重新绑定，或修正 ${BINDING.file}`
-        : '没找到 Chrome/Chromium/Edge。装一个浏览器，或用 init --browser <绝对路径> 绑定。',
-    };
-  }
-  if (r.reason === 'profile-mismatch') {
-    return {
-      ok: false, error: 'PROFILE_MISMATCH', ...base,
-      liveProfile: r.liveProfile, liveProfileDirectory: r.liveProfileDirectory,
-      hint: `CDP ${CDP_URL} 上跑的不是绑定的 profile。要么关掉那个实例（不要杀用户日常浏览器），要么把它启动成绑定的 profile：init --user-data-dir "${PROFILE}"`,
-    };
-  }
-  if (r.reason === 'profile-in-use') {
-    const holderPort = r.holder?.cdpPort ?? null;
-    const manual = `"${CHROME}" --remote-debugging-port=${CDP_PORT} --user-data-dir="${PROFILE}"`
-      + (PROFILE_DIRECTORY ? ` --profile-directory=${PROFILE_DIRECTORY}` : '');
-    return {
-      ok: false,
-      error: holderPort ? 'PROFILE_IN_USE_OTHER_PORT' : 'PROFILE_IN_USE_NO_CDP',
-      holderCdpPort: holderPort,
-      holder: r.holder ? { commandLine: r.holder.commandLine } : null,
+      ok: true,
+      launched: r.state === 'READY_STARTED',
+      // 注意：信封（envelope）会用协议状态覆盖 `state`，所以这里另起名保住生命周期状态
+      lifecycleState: r.state,
+      pid: r.pid ?? null,
+      profileVerified: true,
+      actionsTaken: r.actionsTaken,
       ...base,
-      hint: holderPort
-        ? `绑定的 profile 已被另一个可调试实例占用（端口 ${holderPort}，不是本实例的 ${CDP_PORT}）。`
-          + `同一个 profile 同时只能有一个可调试实例：要么关掉那个实例，要么让本实例复用端口 ${holderPort}`
-          + `（多宿主共享同一个 profile 时不要用不同 agent 名）。手工启动： ${manual}`
-        : `绑定的 profile 正被一个没有调试端口的浏览器占用，再启动也拿不到 CDP。`
-          + `请让用户用绑定参数重启那个实例（或先关掉它），不要杀掉用户的日常浏览器。手工启动： ${manual}`,
     };
   }
-  if (r.reason === 'spawn-failed') {
-    return { ok: false, error: 'SPAWN_FAILED', detail: r.detail, ...base, hint: '浏览器没能启动，先手工执行一次看报错' };
-  }
-  if (r.reason === 'cdp-timeout') {
-    return {
-      ok: false, error: 'CDP_TIMEOUT', ...base,
-      hint: `浏览器进程起来了但 ${CDP_URL} 没开（可能同一个 profile 已被别的实例占用，或调试端口被策略禁用）`,
-    };
-  }
-  return { ok: r.ok, launched: true, profileVerified: r.profileVerified ?? null, ...base };
+
+  // 把 lifecycle 的 state 映射回本 CLI 既有的错误词汇（SKILL.md 与 e2e 依赖这些名字）
+  const MAP = {
+    CHROME_NOT_FOUND: 'CHROME_NOT_FOUND',
+    CDP_PROFILE_MISMATCH: 'PROFILE_MISMATCH',
+    PROFILE_IN_USE_NO_CDP: 'PROFILE_IN_USE_NO_CDP',
+    PROFILE_IN_USE_OTHER_PORT: 'PROFILE_IN_USE_OTHER_PORT',
+    SPAWN_FAILED: 'SPAWN_FAILED',
+    LAUNCH_TIMEOUT: 'CDP_TIMEOUT',
+    CDP_OWNERSHIP_CHANGED: 'PROFILE_MISMATCH',
+  };
+
+  const error = MAP[r.state] || r.state || 'ENSURE_FAILED';
+
+  return {
+    ok: false,
+    error,
+    lifecycleState: r.state,
+    actionsTaken: r.actionsTaken,
+    hint: r.hint,
+    ...(error === 'CHROME_NOT_FOUND' ? { platform: process.platform } : {}),
+    ...(error === 'PROFILE_IN_USE_NO_CDP' || error === 'PROFILE_IN_USE_OTHER_PORT' ? { manual } : {}),
+    ...base,
+  };
 }
 
 // ---------- 新机器预检 ----------
@@ -317,7 +311,7 @@ async function cmdStatus() {
 }
 
 async function cmdTabs({ json } = {}) {
-  const browser = await connect();
+  const browser = await connectEnsured();
   try {
     const ctx = browser.contexts()[0];
     const pages = ctx.pages();
@@ -351,7 +345,6 @@ async function cmdNew(args) {
   });
 }
 
-// 进入项目上下文（点击"打开项目首页"，进入项目内新聊天）
 // 项目空间（project space）
 // 2026-10-22 实测的稳定事实（新版 UI）：
 //   · 侧边栏项目行 = div[role="button"]，文本恰为项目名（旧版 div.__menu-item 已不存在）
@@ -1169,7 +1162,7 @@ async function cmdImage(args) {
         queue: active.map((j) => ({ jobId: j.jobId, conversationId: j.conversationId })),
       };
     }
-    const browser = await connect();
+    const browser = await connectEnsured();
     let lockHeld = false;
     try {
       const l = acquireLock(`image-start`);
@@ -1217,7 +1210,7 @@ async function cmdImage(args) {
   }
 
   if (sub === 'list') {
-    const browser = await connect();
+    const browser = await connectEnsured();
     try {
       const page = await getPage(browser, { create: false });
       return { ok: true, count: store.jobs.length, inFlight: inFlight(store).length, jobs: await listView(page) };
@@ -1230,7 +1223,7 @@ async function cmdImage(args) {
     const jobIds = args.job ? [args.job] : (args.all ? store.jobs.map((j) => j.jobId) : []);
     if (!jobIds.length) return { ok: false, error: 'usage: image wait --job <id> | --all' };
     const timeoutMs = Number(args.timeout || 600) * 1000;
-    const browser = await connect();
+    const browser = await connectEnsured();
     try {
       const page = await getPage(browser, { create: false });
       const results = [];
@@ -1270,7 +1263,7 @@ async function cmdImage(args) {
           + '必须显式加 --allow-ui。无人值守请用默认 --mode api。',
       };
     }
-    const browser = await connect();
+    const browser = await connectEnsured();
     let lockHeld = false;
     try {
       if (needsUi) {
@@ -1361,7 +1354,7 @@ async function cmdImage(args) {
   };
 }
 
-const CMDS = { launch: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
+const CMDS = { launch: cmdLaunch, ensure: cmdLaunch, status: cmdStatus, tabs: cmdTabs, goto: cmdGoto,
   new: cmdNew, project: cmdProject, sources: cmdSources, send: cmdSend, wait: cmdWait, read: cmdRead,
   model: cmdModel, ask: cmdAsk, route: cmdRoute, method: cmdMethod, doctor: cmdDoctor,
   init: cmdInit, config: cmdConfig, image: cmdImage };
@@ -1385,6 +1378,7 @@ const HELP = `chatgpt-web · 确定性操控网页版 ChatGPT
   image download --all         下载全部已出图的任务
   image run --text "..."       单张图一条龙：start → wait → download
   launch                       启动/复用那个绑定的浏览器（CDP ${CDP_URL}）
+  ensure                       同 launch（统一生命周期入口；日常不用手跑，别的命令会自动调）
   status                       连接状态 + 登录态 + 绑定 + 当前会话 id
   tabs                         列出标签页
   goto <url>                   打开指定会话/项目 URL
